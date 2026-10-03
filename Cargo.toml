@@ -2,6 +2,9 @@
 name = "vpn_tui"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A terminal user interface for managing OpenConnect and OpenVPN connections on Linux"
+authors = ["Hosein Nahari <hosein.nahari1000@gmail.com>"]
 
 [dependencies]
 ratatui = "0.29"
