@@ -15,6 +15,9 @@ pub trait ConfigStorage: Send + Sync {
 
     fn import_ovpn(&mut self, src_path: &Path, name: &str) -> Result<Profile>;
     fn get_config_root(&self) -> PathBuf;
+
+    fn load_folders(&self) -> Result<Vec<String>>;
+    fn save_folders(&mut self, folders: &[String]) -> Result<()>;
 }
 
 /// In-memory mock storage for unit testing.
@@ -23,6 +26,7 @@ pub struct InMemoryStorage {
     pub root: PathBuf,
     pub accounts: HashMap<AccountId, Account>,
     pub profiles: HashMap<ProfileId, Profile>,
+    pub folders: Vec<String>,
 }
 
 impl InMemoryStorage {
@@ -31,6 +35,7 @@ impl InMemoryStorage {
             root: PathBuf::from("/mock/config"),
             accounts: HashMap::new(),
             profiles: HashMap::new(),
+            folders: Vec::new(),
         }
     }
 }
@@ -82,6 +87,15 @@ impl ConfigStorage for InMemoryStorage {
 
     fn get_config_root(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    fn load_folders(&self) -> Result<Vec<String>> {
+        Ok(self.folders.clone())
+    }
+
+    fn save_folders(&mut self, folders: &[String]) -> Result<()> {
+        self.folders = folders.to_vec();
+        Ok(())
     }
 }
 
@@ -146,5 +160,17 @@ mod tests {
         assert_eq!(profile.name, "Imported Home");
         assert_eq!(profile.protocol, VpnProtocol::OpenVpn);
         assert_eq!(storage.load_profiles(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_in_memory_storage_folders() {
+        let mut storage = InMemoryStorage::new();
+        assert_eq!(storage.load_folders().unwrap().len(), 0);
+
+        let folders = vec!["Work/Europe".to_string(), "BioVPN/Cisco".to_string()];
+        storage.save_folders(&folders).unwrap();
+
+        let loaded = storage.load_folders().unwrap();
+        assert_eq!(loaded, folders);
     }
 }

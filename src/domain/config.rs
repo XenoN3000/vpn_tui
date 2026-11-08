@@ -94,6 +94,8 @@ pub struct Profile {
     pub openconnect_protocol: Option<String>,
     #[serde(default)]
     pub ssl_policy: SslPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(skip)]
     pub latency: LatencyState,
 }
@@ -118,6 +120,7 @@ impl Profile {
             authgroup: None,
             openconnect_protocol: Some("anyconnect".into()),
             ssl_policy: SslPolicy::default(),
+            group: None,
             latency: LatencyState::Unknown,
         }
     }
@@ -145,12 +148,18 @@ impl Profile {
             authgroup: None,
             openconnect_protocol: None,
             ssl_policy: SslPolicy::default(),
+            group: None,
             latency: LatencyState::Unknown,
         }
     }
 
     pub fn with_account(mut self, account_id: AccountId) -> Self {
         self.account_id = Some(account_id);
+        self
+    }
+
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
         self
     }
 
@@ -241,5 +250,28 @@ mod tests {
         let legacy_profile: Profile =
             toml::from_str(legacy_toml).expect("failed to deserialize legacy");
         assert_eq!(legacy_profile.ssl_policy, SslPolicy::Prompt);
+    }
+
+    #[test]
+    fn test_profile_group_serialization_and_backward_compatibility() {
+        let profile = Profile::new_openconnect("DC Frankfurt", "de.vpn.net:443")
+            .with_group("BioVPN/Cisco/Europe");
+
+        let toml_str = toml::to_string(&profile).expect("failed to serialize profile");
+        assert!(toml_str.contains("group = \"BioVPN/Cisco/Europe\""));
+
+        let deserialized: Profile = toml::from_str(&toml_str).expect("failed to deserialize");
+        assert_eq!(deserialized.group.as_deref(), Some("BioVPN/Cisco/Europe"));
+
+        // Backward compatibility: when group is absent, defaults to None
+        let legacy_toml = r#"
+            name = "Root Node"
+            id = "root-node"
+            protocol = "openconnect"
+            endpoint = "root.vpn.net:443"
+            flags = []
+        "#;
+        let legacy: Profile = toml::from_str(legacy_toml).expect("failed to deserialize legacy");
+        assert_eq!(legacy.group, None);
     }
 }

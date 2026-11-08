@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use std::io::Write;
 use tempfile::tempdir;
-use vpn_tui::app::{ActiveModal, ActivePane, App};
+use vpn_tui::app::{ActiveModal, ActivePane, App, DeleteTarget};
 use vpn_tui::domain::account::Account;
 use vpn_tui::domain::config::{Profile, VpnProtocol};
 use vpn_tui::domain::state::{ConnectionState, LatencyState};
@@ -144,7 +144,7 @@ async fn test_full_vpn_tui_lifecycle_e2e() {
         .iter()
         .position(|p| p.name == "Tokyo Edge")
         .unwrap();
-    app.selected_profile_idx = tokyo_idx;
+    app.select_profile_by_idx(tokyo_idx);
     app.handle_key(KeyCode::Char('e')).await.unwrap();
 
     let adder = match &app.active_modal {
@@ -199,11 +199,12 @@ async fn test_full_vpn_tui_lifecycle_e2e() {
 
     // 10. Delete configuration profile with confirmation
     app.active_pane = ActivePane::Profiles;
-    app.selected_profile_idx = app
+    let del_idx = app
         .profiles
         .iter()
         .position(|p| p.name == "Tokyo Edge")
         .unwrap();
+    app.select_profile_by_idx(del_idx);
 
     // Trigger delete
     app.handle_key(KeyCode::Char('x')).await.unwrap();
@@ -367,7 +368,7 @@ async fn test_ssl_cert_probe_refusal_and_pinning_e2e() {
         .iter()
         .position(|p| p.name == "Strict Gateway")
         .unwrap();
-    app.selected_profile_idx = strict_idx;
+    app.select_profile_by_idx(strict_idx);
 
     app.handle_key(KeyCode::Enter).await.unwrap();
     // Modal should NOT be shown; connection aborted immediately
@@ -377,4 +378,94 @@ async fn test_ssl_cert_probe_refusal_and_pinning_e2e() {
         ConnectionState::Failed { .. }
     ));
     assert!(app.logs.iter().any(|l| l.contains("Strict SSL policy")));
+}
+
+#[tokio::test]
+async fn test_accounts_modal_overlay_and_dismiss() {
+    let mut storage = InMemoryStorage::new();
+    let account = Account::new("Primary Corp");
+    storage.save_account(&account).unwrap();
+
+    let prof = Profile::new_openconnect("Munich DC", "vpn.munich.corp:443");
+    storage.save_profile(&prof).unwrap();
+
+    let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+    assert_eq!(app.active_pane, ActivePane::Profiles);
+    assert_eq!(app.active_modal, ActiveModal::None);
+
+    // Pressing 'a' opens the accounts modal
+    app.handle_key(KeyCode::Char('a')).await.unwrap();
+    assert!(matches!(app.active_modal, ActiveModal::Account(_)));
+
+    // Pressing Esc closes the modal and restores focus to profiles list
+    app.handle_key(KeyCode::Esc).await.unwrap();
+    assert_eq!(app.active_modal, ActiveModal::None);
+    assert_eq!(app.active_pane, ActivePane::Profiles);
+}
+
+#[tokio::test]
+async fn test_sync_modal_and_batch_import_e2e() {
+    let mut storage = InMemoryStorage::new();
+    let account = Account::new("BioVpnCorp");
+    storage.save_account(&account).unwrap();
+
+    let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+    // 1. Press 'S' to open Sync modal
+    app.handle_key(KeyCode::Char('S')).await.unwrap();
+    assert!(matches!(app.active_modal, ActiveModal::SyncManager(_)));
+
+    // 2. Select Method 2 (Batch Paste Server IPs)
+    app.handle_key(KeyCode::Down).await.unwrap();
+    app.handle_key(KeyCode::Down).await.unwrap();
+    app.handle_key(KeyCode::Enter).await.unwrap();
+    assert!(matches!(app.active_modal, ActiveModal::BatchInput(_)));
+
+    // 3. Type server text
+    let server_entry = "Frankfurt 185.120.45.10:443";
+    for c in server_entry.chars() {
+        app.handle_key(KeyCode::Char(c)).await.unwrap();
+    }
+
+    // 4. Press Enter to import
+    app.handle_key(KeyCode::Enter).await.unwrap();
+    assert_eq!(app.active_modal, ActiveModal::None);
+
+    // 5. Verify profile was imported and reloaded into profiles list
+    assert_eq!(app.profiles.len(), 1);
+    assert_eq!(app.profiles[0].name, "Frankfurt");
+    assert_eq!(app.profiles[0].endpoint, "185.120.45.10:443");
+    assert!(app.logs.iter().any(|l| l.contains("batch imported")));
+}
+
+#[tokio::test]
+async fn test_accounts_manager_navigation_and_delete() {
+    let mut storage = InMemoryStorage::new();
+    let account = Account::new("Deletable Corp");
+    storage.save_account(&account).unwrap();
+
+    let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+    assert_eq!(app.accounts.len(), 1);
+
+    // 1. Press 'A' to open Accounts Manager overlay
+    app.handle_key(KeyCode::Char('A')).await.unwrap();
+    assert_eq!(app.active_pane, ActivePane::Accounts);
+
+    // 2. Press 'x' to trigger delete confirmation
+    app.handle_key(KeyCode::Char('x')).await.unwrap();
+    assert!(matches!(
+        app.active_modal,
+        ActiveModal::ConfirmDelete {
+            target: DeleteTarget::Account { .. }
+        }
+    ));
+
+    // 3. Confirm with 'y'
+    app.handle_key(KeyCode::Char('y')).await.unwrap();
+    assert_eq!(app.active_modal, ActiveModal::None);
+    assert_eq!(app.accounts.len(), 0);
+
+    // 4. Press Esc to return to Profiles
+    app.handle_key(KeyCode::Esc).await.unwrap();
+    assert_eq!(app.active_pane, ActivePane::Profiles);
 }

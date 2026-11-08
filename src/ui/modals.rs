@@ -43,6 +43,9 @@ pub fn render_modal(
         ActiveModal::ConfigAdder(adder) => {
             render_config_adder_modal(f, adder, accounts, theme);
         }
+        ActiveModal::NewFolder(folder_state) => {
+            render_new_folder_modal(f, folder_state, theme);
+        }
         ActiveModal::FileBrowser { state, .. } => {
             render_file_browser_modal(f, state, theme);
         }
@@ -51,6 +54,15 @@ pub fn render_modal(
         }
         ActiveModal::CertWarning(cert_state) => {
             render_cert_warning_modal(f, cert_state, theme);
+        }
+        ActiveModal::SyncManager(sync_state) => {
+            render_sync_manager_modal(f, sync_state, accounts, theme);
+        }
+        ActiveModal::SyncFileBrowser { state, .. } => {
+            render_file_browser_modal(f, state, theme);
+        }
+        ActiveModal::BatchInput(batch_state) => {
+            render_batch_input_modal(f, batch_state, accounts, theme);
         }
     }
 }
@@ -85,6 +97,7 @@ fn render_sudo_modal(f: &mut Frame, input: &str, error: Option<&str>, theme: &Th
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(theme.border_type)
         .border_style(theme.border_active)
         .title(" Sudo Authentication Required ");
 
@@ -154,8 +167,52 @@ pub fn render_account_modal(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(theme.border_type)
         .border_style(theme.border_active)
         .title(title);
+
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, area);
+}
+
+pub fn render_new_folder_modal(
+    f: &mut Frame,
+    state: &crate::app::NewFolderModalState,
+    theme: &Theme,
+) {
+    let area = centered_rect(56, 32, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_active)
+        .title(" New Configuration Folder ");
+
+    let mut lines = Vec::new();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Folder Path: ", theme.footer_key),
+        Span::raw(format!("{}_", state.input)),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Tip: Use '/' for nested subfolders (e.g. Work/Europe)",
+        theme.footer_desc,
+    ));
+
+    if let Some(err) = &state.error_msg {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(format!("Error: {}", err), theme.failed));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", theme.footer_key),
+        Span::raw(" Create   "),
+        Span::styled("[Esc]", theme.footer_key),
+        Span::raw(" Cancel"),
+    ]));
 
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
@@ -167,7 +224,7 @@ pub fn render_config_adder_modal(
     accounts: &[crate::domain::account::Account],
     theme: &Theme,
 ) {
-    let area = centered_rect(72, 75, f.area());
+    let area = centered_rect(74, 82, f.area());
     f.render_widget(Clear, area);
 
     let cursor = |idx: usize| {
@@ -273,6 +330,28 @@ pub fn render_config_adder_modal(
                 Span::styled("Custom Flags:   ", field_style(9)),
                 Span::raw(format!("{}_", adder.oc_custom_flags)),
             ]));
+            lines.push(Line::raw(""));
+
+            // Field 10: Group / Folder
+            let folder_display = adder.selected_folder_display();
+            let mut folder_spans = vec![
+                Span::styled(cursor(10), theme.footer_key),
+                Span::styled("Group / Folder: ", field_style(10)),
+            ];
+            if adder.is_on_new_folder() {
+                folder_spans.push(Span::raw(format!(
+                    "< [+ New Folder] >  {}_",
+                    adder.custom_group_input
+                )));
+                folder_spans.push(Span::styled(
+                    "  (Type path, e.g. Work/Europe)",
+                    theme.footer_desc,
+                ));
+            } else {
+                folder_spans.push(Span::raw(format!("< {} >", folder_display)));
+                folder_spans.push(Span::styled("  (Space/←/→ to cycle)", theme.footer_desc));
+            }
+            lines.push(Line::from(folder_spans));
         }
         crate::domain::config::VpnProtocol::OpenVpn => {
             // Field 2: Profile Name
@@ -328,6 +407,28 @@ pub fn render_config_adder_modal(
                 Span::styled("Custom Flags:   ", field_style(7)),
                 Span::raw(format!("{}_", adder.ovpn_custom_flags)),
             ]));
+            lines.push(Line::raw(""));
+
+            // Field 8: Group / Folder
+            let folder_display = adder.selected_folder_display();
+            let mut folder_spans = vec![
+                Span::styled(cursor(8), theme.footer_key),
+                Span::styled("Group / Folder: ", field_style(8)),
+            ];
+            if adder.is_on_new_folder() {
+                folder_spans.push(Span::raw(format!(
+                    "< [+ New Folder] >  {}_",
+                    adder.custom_group_input
+                )));
+                folder_spans.push(Span::styled(
+                    "  (Type path, e.g. BioVPN/OpenVPN)",
+                    theme.footer_desc,
+                ));
+            } else {
+                folder_spans.push(Span::raw(format!("< {} >", folder_display)));
+                folder_spans.push(Span::styled("  (Space/←/→ to cycle)", theme.footer_desc));
+            }
+            lines.push(Line::from(folder_spans));
         }
     }
 
@@ -362,6 +463,7 @@ pub fn render_config_adder_modal(
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(theme.border_type)
         .border_style(theme.border_active)
         .title(title);
 
@@ -379,15 +481,41 @@ pub fn render_confirm_delete_modal(
 
     let (heading, item_name, extra_desc) = match target {
         crate::app::DeleteTarget::Account { name, .. } => (
-            "Are you sure you want to delete this Account?",
+            "Are you sure you want to delete this Account?".to_string(),
             format!("Account: {}", name),
-            "Associated configurations will be unlinked, not deleted.",
+            "Associated configurations will be unlinked, not deleted.".to_string(),
         ),
         crate::app::DeleteTarget::Profile { name, protocol, .. } => (
-            "Are you sure you want to delete this Configuration Profile?",
+            "Are you sure you want to delete this Configuration Profile?".to_string(),
             format!("Profile: {} ({})", name, protocol),
-            "The configuration and associated files will be permanently deleted.",
+            "The configuration and associated files will be permanently deleted.".to_string(),
         ),
+        crate::app::DeleteTarget::Folder {
+            path,
+            profile_count,
+        } => {
+            if *profile_count == 0 {
+                (
+                    format!("Are you sure you want to delete empty folder '{}'?", path),
+                    format!("Folder: {}", path),
+                    "The folder entry will be permanently removed.".to_string(),
+                )
+            } else {
+                (
+                    format!(
+                        "Are you sure you want to delete folder '{}' and all {} profile(s) inside it?",
+                        path, profile_count
+                    ),
+                    format!(
+                        "Folder: {} ({} profile{})",
+                        path,
+                        profile_count,
+                        if *profile_count == 1 { "" } else { "s" }
+                    ),
+                    "This action cannot be undone. All contained profiles and subfolders will be permanently deleted.".to_string(),
+                )
+            }
+        }
     };
 
     let lines = vec![
@@ -409,6 +537,7 @@ pub fn render_confirm_delete_modal(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(theme.border_type)
         .border_style(theme.failed)
         .title(" Confirm Deletion ");
 
@@ -471,6 +600,7 @@ pub fn render_cert_warning_modal(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(theme.border_type)
         .border_style(theme.failed)
         .title(" Untrusted SSL/TLS Certificate Alert ");
 
@@ -561,10 +691,179 @@ pub fn render_file_browser_modal(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(theme.border_type)
         .border_style(theme.border_active)
         .title(" Browse OpenVPN (.ovpn) Files ");
 
     let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, area);
+}
+
+pub fn render_sync_manager_modal(
+    f: &mut Frame,
+    sync_state: &crate::app::SyncManagerState,
+    accounts: &[crate::domain::account::Account],
+    theme: &Theme,
+) {
+    let area = centered_rect(65, 55, f.area());
+    f.render_widget(Clear, area);
+
+    let methods = [
+        (
+            "[1] BioVPN Online Sync",
+            "Sync directly from BioVPN portal (runs sync script/session)",
+        ),
+        (
+            "[2] Import OpenVPN Archive (.zip)",
+            "Extract .ovpn files & auto-generate matching Cisco profiles",
+        ),
+        (
+            "[3] Batch Paste Server IPs",
+            "Paste raw list of server names and endpoints",
+        ),
+    ];
+
+    let mut lines = Vec::new();
+    lines.push(Line::styled(
+        "Select Sync / Import Method:",
+        theme.footer_key,
+    ));
+    lines.push(Line::raw(""));
+
+    for (i, (title, desc)) in methods.iter().enumerate() {
+        let is_sel = i == sync_state.selected_method_idx;
+        let marker = if is_sel { "▶ " } else { "  " };
+        let style = if is_sel { theme.highlight } else { theme.text };
+        lines.push(Line::from(vec![
+            Span::styled(marker, theme.footer_key),
+            Span::styled(*title, style),
+        ]));
+        lines.push(Line::styled(format!("    {}", desc), theme.footer_desc));
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::raw(
+        "────────────────────────────────────────────────────────────────",
+    ));
+
+    let target_acc_name = accounts
+        .get(sync_state.target_account_idx)
+        .map(|a| a.name.as_str())
+        .unwrap_or("No Account Linked");
+    lines.push(Line::from(vec![
+        Span::styled("Target Account: ", theme.footer_key),
+        Span::styled(
+            format!("[ {} ] (Tab to cycle)", target_acc_name),
+            theme.text,
+        ),
+    ]));
+
+    let cisco_check = if sync_state.with_cisco { "[x]" } else { "[ ]" };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} ", cisco_check), theme.connected),
+        Span::styled(
+            "Auto-generate Cisco OpenConnect profiles from OpenVPN remotes (Space to toggle)",
+            theme.footer_desc,
+        ),
+    ]));
+
+    if let Some(ref msg) = sync_state.status_message {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(msg, theme.connected));
+    }
+    if let Some(ref err) = sync_state.error_message {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(err, theme.failed));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[↑/↓]", theme.footer_key),
+        Span::raw(" Select Method   "),
+        Span::styled("[Tab]", theme.footer_key),
+        Span::raw(" Cycle Account   "),
+        Span::styled("[Enter]", theme.footer_key),
+        Span::raw(" Proceed   "),
+        Span::styled("[Esc]", theme.footer_key),
+        Span::raw(" Cancel"),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_active)
+        .title(" Sync & Import Configurations ");
+
+    let p = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(p, area);
+}
+
+pub fn render_batch_input_modal(
+    f: &mut Frame,
+    batch_state: &crate::app::BatchInputState,
+    accounts: &[crate::domain::account::Account],
+    theme: &Theme,
+) {
+    let area = centered_rect(65, 55, f.area());
+    f.render_widget(Clear, area);
+
+    let target_acc_name = accounts
+        .get(batch_state.target_account_idx)
+        .map(|a| a.name.as_str())
+        .unwrap_or("No Account Linked");
+
+    let mut lines = Vec::new();
+    lines.push(Line::styled(
+        format!("Target Account: {}", target_acc_name),
+        theme.footer_desc,
+    ));
+    lines.push(Line::styled(
+        "Enter server entries (Format: <Name> <IP/Host:Port>):",
+        theme.footer_key,
+    ));
+    lines.push(Line::styled(
+        "Example: Netherlands 45.93.169.132",
+        theme.footer_desc,
+    ));
+    lines.push(Line::raw(
+        "────────────────────────────────────────────────────────────────",
+    ));
+
+    if batch_state.text.is_empty() {
+        lines.push(Line::styled(
+            "  (Type or paste server entries here...)",
+            theme.footer_desc,
+        ));
+    } else {
+        for line in batch_state.text.lines() {
+            lines.push(Line::raw(line));
+        }
+    }
+
+    if let Some(ref err) = batch_state.error_message {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(err, theme.failed));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", theme.footer_key),
+        Span::raw(" Import All   "),
+        Span::styled("[Esc]", theme.footer_key),
+        Span::raw(" Cancel"),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_active)
+        .title(" Batch Add Servers ");
+
+    let p = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: true });
     f.render_widget(p, area);
 }
 
@@ -600,6 +899,7 @@ pub mod config_adder {
         assert!(buffer.contains("SSL Policy:"));
         assert!(buffer.contains("Prompt on Mismatch"));
         assert!(buffer.contains("--no-dtls"));
+        assert!(buffer.contains("Group / Folder:"));
     }
 
     #[test]
@@ -624,6 +924,29 @@ pub mod config_adder {
         assert!(buffer.contains("/home/user/vpn.ovpn"));
         assert!(buffer.contains("F2") && buffer.contains("Browse"));
         assert!(buffer.contains("--redirect-gateway def1"));
+        assert!(buffer.contains("Group / Folder:"));
+    }
+
+    #[test]
+    fn test_render_config_adder_modal_with_folder_selection() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+
+        let existing_folders = vec!["BioVPN/Cisco".to_string(), "Work/Europe".to_string()];
+        let mut adder = ConfigAdderState::new_with_folders(None, &existing_folders);
+        adder.protocol = VpnProtocol::OpenConnect;
+        adder.folder_option_idx = 1; // "BioVPN/Cisco"
+
+        terminal
+            .draw(|f| {
+                render_config_adder_modal(f, &adder, &[], &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("BioVPN/Cisco"));
+        assert!(buffer.contains("Space/←/→ to cycle"));
     }
 }
 
@@ -752,6 +1075,41 @@ pub mod confirm_delete {
         assert!(buffer_acc.contains("Confirm Deletion"));
         assert!(buffer_acc.contains("Master Account"));
         assert!(buffer_acc.contains("unlinked, not deleted"));
+
+        // 3. Empty folder delete target
+        let empty_folder_target = DeleteTarget::Folder {
+            path: "EmptyFolder".to_string(),
+            profile_count: 0,
+        };
+
+        terminal
+            .draw(|f| {
+                render_confirm_delete_modal(f, &empty_folder_target, &theme);
+            })
+            .unwrap();
+
+        let buffer_empty = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer_empty.contains("Confirm Deletion"));
+        assert!(buffer_empty.contains("delete empty folder 'EmptyFolder'"));
+        assert!(buffer_empty.contains("permanently removed"));
+
+        // 4. Populated folder delete target
+        let pop_folder_target = DeleteTarget::Folder {
+            path: "Work/Europe".to_string(),
+            profile_count: 3,
+        };
+
+        terminal
+            .draw(|f| {
+                render_confirm_delete_modal(f, &pop_folder_target, &theme);
+            })
+            .unwrap();
+
+        let buffer_pop = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer_pop.contains("Confirm Deletion"));
+        assert!(buffer_pop.contains("Work/Europe"));
+        assert!(buffer_pop.contains("3 profile"));
+        assert!(buffer_pop.contains("action cannot be undone"));
     }
 }
 
@@ -848,5 +1206,80 @@ pub mod cert_warning {
         assert!(buffer.contains("pin-sha256:Iir9uh8Bo4nogJDh6X3C3ulRIXorMbCvCAJPmkCC4os="));
         assert!(buffer.contains("[r / Esc]") && buffer.contains("Refuse & Abort"));
         assert!(buffer.contains("[a / Enter]") && buffer.contains("Accept & Pin"));
+    }
+}
+
+#[cfg(test)]
+pub mod sync_manager {
+    use super::*;
+    use crate::app::{BatchInputState, SyncManagerState};
+    use crate::domain::account::Account;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn test_render_sync_manager_modal() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let accounts = vec![Account::new("BioAccount")];
+        let sync_state = SyncManagerState::new();
+
+        terminal
+            .draw(|f| {
+                render_sync_manager_modal(f, &sync_state, &accounts, &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("Sync & Import Configurations"));
+        assert!(buffer.contains("BioVPN Online Sync"));
+        assert!(buffer.contains("Import OpenVPN Archive (.zip)"));
+        assert!(buffer.contains("Batch Paste Server IPs"));
+        assert!(buffer.contains("BioAccount"));
+    }
+
+    #[test]
+    fn test_render_batch_input_modal() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let accounts = vec![Account::new("BioAccount")];
+        let batch_state = BatchInputState {
+            text: "Germany 185.120.45.10\nNetherlands 45.93.169.132".into(),
+            target_account_idx: 0,
+            error_message: None,
+        };
+
+        terminal
+            .draw(|f| {
+                render_batch_input_modal(f, &batch_state, &accounts, &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("Batch Add Servers"));
+        assert!(buffer.contains("Germany 185.120.45.10"));
+        assert!(buffer.contains("Netherlands 45.93.169.132"));
+    }
+
+    #[test]
+    fn test_render_new_folder_modal() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let mut state = crate::app::NewFolderModalState::new();
+        state.input = "Personal/Asia".into();
+
+        terminal
+            .draw(|f| {
+                render_new_folder_modal(f, &state, &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("New Configuration Folder"));
+        assert!(buffer.contains("Personal/Asia"));
+        assert!(buffer.contains("nested subfolders"));
     }
 }

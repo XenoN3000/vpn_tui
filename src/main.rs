@@ -81,11 +81,10 @@ async fn main() -> Result<()> {
             }
             _ = net_ticker.tick() => {
                 if let vpn_tui::domain::state::ConnectionState::Connected { interface, .. } = &app.connection_state {
-                    if let Some(stats) = net_monitor.read_interface(interface) {
-                        app.net_stats = Some(stats);
-                    }
+                    let stats = net_monitor.read_interface(interface);
+                    app.update_net_stats(stats);
                 } else {
-                    app.net_stats = None;
+                    app.update_net_stats(None);
                 }
             }
             _ = ticker.tick() => {

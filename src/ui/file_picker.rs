@@ -84,7 +84,9 @@ impl FileBrowserState {
                             path,
                             is_dir: true,
                         });
-                    } else if file_name.to_lowercase().ends_with(".ovpn") {
+                    } else if file_name.to_lowercase().ends_with(".ovpn")
+                        || file_name.to_lowercase().ends_with(".zip")
+                    {
                         ovpn_files.push(FileEntry {
                             name: file_name,
                             path,

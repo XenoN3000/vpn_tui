@@ -12,6 +12,12 @@ struct AccountsManifest {
     pub accounts: Vec<Account>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FoldersManifest {
+    #[serde(default)]
+    pub folders: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FsConfigStorage {
     root: PathBuf,
@@ -62,6 +68,10 @@ impl FsConfigStorage {
 
     pub fn accounts_file(&self) -> PathBuf {
         self.root.join("accounts.toml")
+    }
+
+    pub fn folders_file(&self) -> PathBuf {
+        self.root.join("folders.toml")
     }
 
     fn ensure_dirs(&self) -> Result<()> {
@@ -143,10 +153,11 @@ impl ConfigStorage for FsConfigStorage {
                     } else if proto == VpnProtocol::OpenVpn
                         && path.extension().is_some_and(|ext| ext == "ovpn")
                     {
-                        // Check if a companion .toml already loaded this profile
+                        // Check if a companion .toml exists or already loaded this profile
                         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        let has_companion_toml = path.with_extension("toml").exists();
                         let already_loaded = profiles.iter().any(|p| p.id.0 == stem);
-                        if !already_loaded {
+                        if !has_companion_toml && !already_loaded {
                             let profile = Profile::new_openvpn(
                                 stem.to_string(),
                                 "auto-detected",
@@ -219,6 +230,29 @@ impl ConfigStorage for FsConfigStorage {
     fn get_config_root(&self) -> PathBuf {
         self.root.clone()
     }
+
+    fn load_folders(&self) -> Result<Vec<String>> {
+        let file = self.folders_file();
+        if !file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&file)
+            .with_context(|| format!("Failed to read folders file {:?}", file))?;
+        let manifest: FoldersManifest = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse folders file {:?}", file))?;
+        Ok(manifest.folders)
+    }
+
+    fn save_folders(&mut self, folders: &[String]) -> Result<()> {
+        self.ensure_dirs()?;
+        let manifest = FoldersManifest {
+            folders: folders.to_vec(),
+        };
+        let serialized = toml::to_string_pretty(&manifest)?;
+        fs::write(self.folders_file(), serialized)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -287,5 +321,40 @@ mod tests {
         let storage = FsConfigStorage::new();
         let root = storage.get_config_root();
         assert!(!root.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_fs_storage_profile_group_persistence() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        let profile =
+            Profile::new_openconnect("Munich DC", "10.0.0.1:443").with_group("BioVPN/Cisco/Europe");
+
+        storage.save_profile(&profile).unwrap();
+
+        let loaded = storage.load_profiles(None).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].group.as_deref(), Some("BioVPN/Cisco/Europe"));
+    }
+
+    #[test]
+    fn test_fs_storage_folders_persistence() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        assert_eq!(storage.load_folders().unwrap().len(), 0);
+
+        let folders = vec![
+            "BioVPN/Cisco".to_string(),
+            "BioVPN/OpenVPN".to_string(),
+            "Work/Europe/Munich".to_string(),
+        ];
+        storage.save_folders(&folders).unwrap();
+
+        // Check file exists on disk and loads back identically
+        assert!(storage.folders_file().exists());
+        let loaded = storage.load_folders().unwrap();
+        assert_eq!(loaded, folders);
     }
 }
