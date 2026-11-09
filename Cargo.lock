@@ -1713,6 +1713,7 @@ name = "vpn_tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "crossterm",
  "futures-util",
  "libc",
@@ -1720,6 +1721,7 @@ dependencies = [
  "ratatui",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

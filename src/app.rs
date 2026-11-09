@@ -1,6 +1,11 @@
 use crate::domain::account::{Account, AccountId};
-use crate::domain::config::{Profile, ProfileId, SslPolicy, VpnProtocol};
+use crate::domain::config::{
+    Profile, ProfileId, ProxyCore, ProxyRoutingMode, SslPolicy, VpnProtocol,
+};
 use crate::domain::state::{CertWarningState, ConnectionState, LatencyState};
+use crate::domain::subscription::{
+    current_timestamp_string, fetch_subscription_feed, parse_subscription_profiles, Subscription,
+};
 use crate::infra::net_monitor::NetStats;
 use crate::ports::pinger::Pinger;
 use crate::ports::storage::ConfigStorage;
@@ -84,6 +89,15 @@ pub struct ConfigAdderState {
     pub ovpn_dev_tun: bool,
     pub ovpn_custom_flags: String,
 
+    // V2Ray fields
+    pub v2_name: String,
+    pub v2_link: String,
+    pub v2_config_path: String,
+    pub v2_routing_mode: ProxyRoutingMode,
+    pub v2_core: ProxyCore,
+    pub v2_custom_flags: String,
+    pub v2_save_as_subscription: bool,
+
     pub error_msg: Option<String>,
 }
 
@@ -119,6 +133,14 @@ impl ConfigAdderState {
             ovpn_redirect_gateway: true,
             ovpn_dev_tun: true,
             ovpn_custom_flags: String::new(),
+
+            v2_name: String::new(),
+            v2_link: String::new(),
+            v2_config_path: String::new(),
+            v2_routing_mode: ProxyRoutingMode::default(),
+            v2_core: ProxyCore::default(),
+            v2_custom_flags: String::new(),
+            v2_save_as_subscription: true,
 
             error_msg: None,
         }
@@ -211,6 +233,21 @@ impl ConfigAdderState {
                 }
                 state.ovpn_custom_flags = custom_flags.join(" ");
             }
+            VpnProtocol::V2Ray => {
+                state.v2_name = profile.name.clone();
+                if let Some(endpoint) = &profile.proxy_endpoint {
+                    if let Some(raw) = &endpoint.raw_link {
+                        state.v2_link = raw.clone();
+                    }
+                }
+                if let Some(path) = &profile.proxy_config_file {
+                    state.v2_config_path = path.to_string_lossy().to_string();
+                }
+                state.v2_routing_mode = profile.proxy_routing_mode;
+                state.v2_core = profile.proxy_core;
+                state.v2_custom_flags = profile.flags.join(" ");
+                state.v2_save_as_subscription = true;
+            }
         }
 
         state
@@ -220,6 +257,13 @@ impl ConfigAdderState {
         match self.protocol {
             VpnProtocol::OpenConnect => 11,
             VpnProtocol::OpenVpn => 9,
+            VpnProtocol::V2Ray => {
+                if self.v2_link.starts_with("http://") || self.v2_link.starts_with("https://") {
+                    9
+                } else {
+                    8
+                }
+            }
         }
     }
 
@@ -397,6 +441,48 @@ impl SyncManagerState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionManagerState {
+    pub subscriptions: Vec<Subscription>,
+    pub selected_idx: usize,
+    pub is_adding: bool,
+    pub add_field_idx: usize,
+    pub add_name: String,
+    pub add_url: String,
+    pub add_folder: String,
+    pub add_routing_mode: ProxyRoutingMode,
+    pub add_core_pref: ProxyCore,
+    pub status_message: Option<String>,
+    pub error_message: Option<String>,
+}
+
+impl Default for SubscriptionManagerState {
+    fn default() -> Self {
+        Self {
+            subscriptions: Vec::new(),
+            selected_idx: 0,
+            is_adding: false,
+            add_field_idx: 0,
+            add_name: String::new(),
+            add_url: String::new(),
+            add_folder: "Subscription".to_string(),
+            add_routing_mode: ProxyRoutingMode::default(),
+            add_core_pref: ProxyCore::default(),
+            status_message: None,
+            error_message: None,
+        }
+    }
+}
+
+impl SubscriptionManagerState {
+    pub fn new(subscriptions: Vec<Subscription>) -> Self {
+        Self {
+            subscriptions,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchInputState {
     pub text: String,
     pub target_account_idx: usize,
@@ -439,6 +525,7 @@ pub enum ActiveModal {
     CertWarning(CertWarningState),
     SyncManager(SyncManagerState),
     BatchInput(BatchInputState),
+    SubscriptionManager(SubscriptionManagerState),
 }
 
 pub struct App<S: ConfigStorage, R: VpnRunner, P: Pinger> {
@@ -451,6 +538,8 @@ pub struct App<S: ConfigStorage, R: VpnRunner, P: Pinger> {
 
     pub profiles: Vec<Profile>,
     pub selected_profile_idx: usize,
+
+    pub subscriptions: Vec<Subscription>,
 
     pub active_pane: ActivePane,
     pub active_modal: ActiveModal,
@@ -482,6 +571,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         let accounts = storage.load_accounts().unwrap_or_default();
         let profiles = storage.load_profiles(None).unwrap_or_default();
         let custom_folders = storage.load_folders().unwrap_or_default();
+        let subscriptions = storage.load_subscriptions().unwrap_or_default();
 
         let mut expanded_folders = std::collections::HashSet::new();
         for p in &profiles {
@@ -521,6 +611,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
             selected_account_idx: 0,
             profiles,
             selected_profile_idx: 0,
+            subscriptions,
             active_pane: ActivePane::Profiles,
             active_modal: ActiveModal::None,
             connection_state: ConnectionState::Disconnected,
@@ -577,6 +668,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
     pub fn reload_profiles(&mut self) {
         self.profiles = self.storage.load_profiles(None).unwrap_or_default();
         self.custom_folders = self.storage.load_folders().unwrap_or_default();
+        self.subscriptions = self.storage.load_subscriptions().unwrap_or_default();
         if self.selected_profile_idx >= self.profiles.len() && !self.profiles.is_empty() {
             self.selected_profile_idx = self.profiles.len() - 1;
         }
@@ -608,6 +700,67 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         folders.sort();
         folders.dedup();
         folders
+    }
+
+    pub async fn sync_subscription_by_idx(&mut self, idx: usize) -> Result<usize> {
+        if idx >= self.subscriptions.len() {
+            anyhow::bail!("Invalid subscription index: {}", idx);
+        }
+        let sub = self.subscriptions[idx].clone();
+        let body = fetch_subscription_feed(&sub.url).await?;
+        let profiles = parse_subscription_profiles(
+            &body,
+            &sub.folder,
+            sub.routing_mode,
+            sub.core_pref,
+        );
+        if profiles.is_empty() {
+            anyhow::bail!("No valid proxy nodes found in subscription feed");
+        }
+
+        // Prune existing profiles in this folder
+        let existing = self
+            .storage
+            .load_profiles(Some(VpnProtocol::V2Ray))
+            .unwrap_or_default();
+        for p in existing {
+            if p.group.as_deref() == Some(&sub.folder) {
+                let _ = self.storage.delete_profile(&p.id);
+            }
+        }
+
+        // Save new profiles
+        for prof in &profiles {
+            self.storage.save_profile(prof)?;
+        }
+
+        // Update timestamp
+        self.subscriptions[idx].last_synced = Some(current_timestamp_string());
+        let _ = self.storage.save_subscriptions(&self.subscriptions);
+
+        self.ensure_custom_folder(&sub.folder);
+        self.expanded_folders.insert(sub.folder.clone());
+        self.reload_profiles();
+        self.add_log(format!(
+            "Synced subscription '{}': updated {} nodes in '{}'.",
+            sub.name,
+            profiles.len(),
+            sub.folder
+        ));
+        Ok(profiles.len())
+    }
+
+    pub async fn sync_all_subscriptions(&mut self) -> Result<(usize, usize)> {
+        let mut total_nodes = 0;
+        let mut successful = 0;
+        let count = self.subscriptions.len();
+        for idx in 0..count {
+            if let Ok(nodes) = self.sync_subscription_by_idx(idx).await {
+                total_nodes += nodes;
+                successful += 1;
+            }
+        }
+        Ok((successful, total_nodes))
     }
 
     pub fn visible_tree(&self) -> Vec<crate::ui::tree::VisibleTreeNode> {
@@ -852,7 +1005,12 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
             }
         }
 
-        if !self.runner.check_sudo_cached().await {
+        let needs_sudo = match profile.protocol {
+            VpnProtocol::OpenConnect | VpnProtocol::OpenVpn => true,
+            VpnProtocol::V2Ray => profile.proxy_routing_mode == ProxyRoutingMode::Tun,
+        };
+
+        if needs_sudo && !self.runner.check_sudo_cached().await {
             self.active_modal = ActiveModal::SudoPassword {
                 input: String::new(),
                 error: None,
@@ -1100,9 +1258,17 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::ConfigAdder(adder);
                 }
                 KeyCode::F(2) => {
-                    if adder.protocol == VpnProtocol::OpenVpn {
-                        let initial = if !adder.ovpn_path.trim().is_empty() {
+                    if adder.protocol == VpnProtocol::OpenVpn
+                        || adder.protocol == VpnProtocol::V2Ray
+                    {
+                        let initial = if adder.protocol == VpnProtocol::OpenVpn
+                            && !adder.ovpn_path.trim().is_empty()
+                        {
                             Some(std::path::PathBuf::from(adder.ovpn_path.trim()))
+                        } else if adder.protocol == VpnProtocol::V2Ray
+                            && !adder.v2_config_path.trim().is_empty()
+                        {
+                            Some(std::path::PathBuf::from(adder.v2_config_path.trim()))
                         } else {
                             None
                         };
@@ -1152,7 +1318,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                         },
                         VpnProtocol::OpenVpn => match adder.field_idx {
                             0 => {
-                                adder.protocol = VpnProtocol::OpenConnect;
+                                adder.protocol = VpnProtocol::V2Ray;
                                 adder.field_idx = 0;
                             }
                             1 => {
@@ -1179,6 +1345,37 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             }
                             _ => {}
                         },
+                        VpnProtocol::V2Ray => match adder.field_idx {
+                            0 => {
+                                adder.protocol = VpnProtocol::OpenConnect;
+                                adder.field_idx = 0;
+                            }
+                            1 => {
+                                adder.account_idx =
+                                    next_account_idx(adder.account_idx, self.accounts.len());
+                            }
+                            2 => adder.v2_name.push(' '),
+                            3 => adder.v2_link.push(' '),
+                            4 => adder.v2_config_path.push(' '),
+                            5 => {
+                                adder.v2_routing_mode = adder.v2_routing_mode.next();
+                            }
+                            6 => {
+                                adder.v2_core = adder.v2_core.next();
+                            }
+                            7 => {
+                                if adder.is_on_new_folder() {
+                                    adder.custom_group_input.push(' ');
+                                    adder.group.push(' ');
+                                } else {
+                                    adder.next_folder_option();
+                                }
+                            }
+                            8 => {
+                                adder.v2_save_as_subscription = !adder.v2_save_as_subscription;
+                            }
+                            _ => {}
+                        },
                     }
                     self.active_modal = ActiveModal::ConfigAdder(adder);
                 }
@@ -1186,7 +1383,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     match adder.protocol {
                         VpnProtocol::OpenConnect => match adder.field_idx {
                             0 => {
-                                adder.protocol = VpnProtocol::OpenVpn;
+                                adder.protocol = VpnProtocol::V2Ray;
                             }
                             1 => {
                                 adder.account_idx =
@@ -1233,6 +1430,28 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             }
                             _ => {}
                         },
+                        VpnProtocol::V2Ray => match adder.field_idx {
+                            0 => {
+                                adder.protocol = VpnProtocol::OpenVpn;
+                            }
+                            1 => {
+                                adder.account_idx =
+                                    prev_account_idx(adder.account_idx, self.accounts.len());
+                            }
+                            5 => {
+                                adder.v2_routing_mode = adder.v2_routing_mode.next();
+                            }
+                            6 => {
+                                adder.v2_core = adder.v2_core.next();
+                            }
+                            7 => {
+                                adder.prev_folder_option();
+                            }
+                            8 => {
+                                adder.v2_save_as_subscription = !adder.v2_save_as_subscription;
+                            }
+                            _ => {}
+                        },
                     }
                     self.active_modal = ActiveModal::ConfigAdder(adder);
                 }
@@ -1263,7 +1482,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                         },
                         VpnProtocol::OpenVpn => match adder.field_idx {
                             0 => {
-                                adder.protocol = VpnProtocol::OpenConnect;
+                                adder.protocol = VpnProtocol::V2Ray;
                             }
                             1 => {
                                 adder.account_idx =
@@ -1277,6 +1496,28 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             }
                             8 => {
                                 adder.next_folder_option();
+                            }
+                            _ => {}
+                        },
+                        VpnProtocol::V2Ray => match adder.field_idx {
+                            0 => {
+                                adder.protocol = VpnProtocol::OpenConnect;
+                            }
+                            1 => {
+                                adder.account_idx =
+                                    next_account_idx(adder.account_idx, self.accounts.len());
+                            }
+                            5 => {
+                                adder.v2_routing_mode = adder.v2_routing_mode.next();
+                            }
+                            6 => {
+                                adder.v2_core = adder.v2_core.next();
+                            }
+                            7 => {
+                                adder.next_folder_option();
+                            }
+                            8 => {
+                                adder.v2_save_as_subscription = !adder.v2_save_as_subscription;
                             }
                             _ => {}
                         },
@@ -1336,6 +1577,27 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             }
                             _ => {}
                         },
+                        VpnProtocol::V2Ray => match adder.field_idx {
+                            2 => {
+                                adder.v2_name.pop();
+                            }
+                            3 => {
+                                adder.v2_link.pop();
+                            }
+                            4 => {
+                                adder.v2_config_path.pop();
+                            }
+                            7 => {
+                                if adder.is_on_new_folder() {
+                                    adder.custom_group_input.pop();
+                                    adder.group.pop();
+                                } else {
+                                    adder.folder_option_idx = 0;
+                                    adder.sync_group_from_selection();
+                                }
+                            }
+                            _ => {}
+                        },
                     }
                     self.active_modal = ActiveModal::ConfigAdder(adder);
                 }
@@ -1376,11 +1638,32 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             }
                             _ => {}
                         },
+                        VpnProtocol::V2Ray => match adder.field_idx {
+                            2 => adder.v2_name.push(c),
+                            3 => adder.v2_link.push(c),
+                            4 => adder.v2_config_path.push(c),
+                            7 => {
+                                if !adder.is_on_new_folder() {
+                                    adder.folder_option_idx =
+                                        adder.folder_options.len().saturating_sub(1);
+                                    adder.custom_group_input.clear();
+                                    adder.group.clear();
+                                }
+                                adder.custom_group_input.push(c);
+                                adder.group.push(c);
+                            }
+                            8 => {
+                                if c == ' ' {
+                                    adder.v2_save_as_subscription = !adder.v2_save_as_subscription;
+                                }
+                            }
+                            _ => {}
+                        },
                     }
                     self.active_modal = ActiveModal::ConfigAdder(adder);
                 }
                 KeyCode::Enter => {
-                    self.submit_config_adder(adder)?;
+                    self.submit_config_adder(adder).await?;
                 }
                 _ => {
                     self.active_modal = ActiveModal::ConfigAdder(adder);
@@ -1631,7 +1914,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::SyncManager(state);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if state.selected_method_idx < 2 {
+                    if state.selected_method_idx < 3 {
                         state.selected_method_idx += 1;
                     }
                     self.active_modal = ActiveModal::SyncManager(state);
@@ -1747,6 +2030,11 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             target_account_idx: state.target_account_idx,
                             error_message: None,
                         });
+                    }
+                    3 => {
+                        self.active_modal = ActiveModal::SubscriptionManager(
+                            SubscriptionManagerState::new(self.subscriptions.clone()),
+                        );
                     }
                     _ => {
                         self.active_modal = ActiveModal::SyncManager(state);
@@ -1900,6 +2188,229 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 }
                 _ => {
                     self.active_modal = ActiveModal::BatchInput(state);
+                }
+            },
+            ActiveModal::SubscriptionManager(mut state) => match code {
+                KeyCode::Esc => {
+                    if state.is_adding {
+                        state.is_adding = false;
+                        self.active_modal = ActiveModal::SubscriptionManager(state);
+                    } else {
+                        self.active_modal = ActiveModal::SyncManager(SyncManagerState {
+                            selected_method_idx: 3,
+                            ..Default::default()
+                        });
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') if !state.is_adding => {
+                    state.selected_idx = state.selected_idx.saturating_sub(1);
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Down | KeyCode::Char('j') if !state.is_adding => {
+                    if state.selected_idx + 1 < self.subscriptions.len() {
+                        state.selected_idx += 1;
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Char('u') if !state.is_adding => {
+                    if !self.subscriptions.is_empty() && state.selected_idx < self.subscriptions.len() {
+                        match self.sync_subscription_by_idx(state.selected_idx).await {
+                            Ok(count) => {
+                                state.subscriptions = self.subscriptions.clone();
+                                state.status_message =
+                                    Some(format!("Synced {} nodes successfully", count));
+                                state.error_message = None;
+                            }
+                            Err(e) => {
+                                state.error_message = Some(format!("Sync failed: {}", e));
+                                state.status_message = None;
+                            }
+                        }
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Char('U') if !state.is_adding => {
+                    if !self.subscriptions.is_empty() {
+                        match self.sync_all_subscriptions().await {
+                            Ok((subs, nodes)) => {
+                                state.subscriptions = self.subscriptions.clone();
+                                state.status_message = Some(format!(
+                                    "Updated {} subscriptions ({} nodes total)",
+                                    subs, nodes
+                                ));
+                                state.error_message = None;
+                            }
+                            Err(e) => {
+                                state.error_message = Some(format!("Sync failed: {}", e));
+                                state.status_message = None;
+                            }
+                        }
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Char('a') if !state.is_adding => {
+                    state.is_adding = true;
+                    state.add_field_idx = 0;
+                    state.add_name.clear();
+                    state.add_url.clear();
+                    state.add_folder = "Subscription".to_string();
+                    state.status_message = None;
+                    state.error_message = None;
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Char('d') if !state.is_adding => {
+                    if !self.subscriptions.is_empty() && state.selected_idx < self.subscriptions.len() {
+                        let removed = self.subscriptions.remove(state.selected_idx);
+                        let _ = self.storage.save_subscriptions(&self.subscriptions);
+                        state.subscriptions = self.subscriptions.clone();
+                        if state.selected_idx >= self.subscriptions.len() && !self.subscriptions.is_empty() {
+                            state.selected_idx = self.subscriptions.len() - 1;
+                        }
+                        state.status_message = Some(format!("Deleted subscription '{}'", removed.name));
+                        state.error_message = None;
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Tab | KeyCode::Down if state.is_adding => {
+                    state.add_field_idx = (state.add_field_idx + 1) % 5;
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::BackTab | KeyCode::Up if state.is_adding => {
+                    state.add_field_idx = if state.add_field_idx == 0 {
+                        4
+                    } else {
+                        state.add_field_idx - 1
+                    };
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Backspace if state.is_adding => {
+                    match state.add_field_idx {
+                        0 => {
+                            state.add_name.pop();
+                        }
+                        1 => {
+                            state.add_url.pop();
+                        }
+                        2 => {
+                            state.add_folder.pop();
+                        }
+                        _ => {}
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Char(' ') if state.is_adding => {
+                    match state.add_field_idx {
+                        0 => state.add_name.push(' '),
+                        1 => state.add_url.push(' '),
+                        2 => state.add_folder.push(' '),
+                        3 => state.add_routing_mode = state.add_routing_mode.next(),
+                        4 => state.add_core_pref = state.add_core_pref.next(),
+                        _ => {}
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Char(c) if state.is_adding => {
+                    match state.add_field_idx {
+                        0 => state.add_name.push(c),
+                        1 => state.add_url.push(c),
+                        2 => state.add_folder.push(c),
+                        3 => state.add_routing_mode = state.add_routing_mode.next(),
+                        4 => state.add_core_pref = state.add_core_pref.next(),
+                        _ => {}
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                KeyCode::Enter if state.is_adding => {
+                    let url = state.add_url.trim().to_string();
+                    let name = if state.add_name.trim().is_empty() {
+                        "Subscription".to_string()
+                    } else {
+                        state.add_name.trim().to_string()
+                    };
+                    let folder = if state.add_folder.trim().is_empty() {
+                        name.clone()
+                    } else {
+                        state.add_folder.trim().to_string()
+                    };
+
+                    if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                        state.error_message =
+                            Some("Please enter a valid HTTP/HTTPS URL".to_string());
+                        self.active_modal = ActiveModal::SubscriptionManager(state);
+                        return Ok(());
+                    }
+
+                    match fetch_subscription_feed(&url).await {
+                        Ok(body) => {
+                            let profiles = parse_subscription_profiles(
+                                &body,
+                                &folder,
+                                state.add_routing_mode,
+                                state.add_core_pref,
+                            );
+                            if profiles.is_empty() {
+                                state.error_message = Some(
+                                    "No valid proxy nodes found in subscription feed".to_string(),
+                                );
+                                self.active_modal = ActiveModal::SubscriptionManager(state);
+                                return Ok(());
+                            }
+
+                            let mut sub = Subscription::new(&name, &url, &folder)
+                                .with_routing_mode(state.add_routing_mode)
+                                .with_core_pref(state.add_core_pref);
+                            sub.last_synced = Some(current_timestamp_string());
+
+                            for prof in &profiles {
+                                let _ = self.storage.save_profile(prof);
+                            }
+                            self.ensure_custom_folder(&folder);
+                            self.expanded_folders.insert(folder.clone());
+
+                            if let Some(pos) = self
+                                .subscriptions
+                                .iter()
+                                .position(|s| s.url == url || s.id == sub.id)
+                            {
+                                self.subscriptions[pos] = sub;
+                            } else {
+                                self.subscriptions.push(sub);
+                            }
+                            let _ = self.storage.save_subscriptions(&self.subscriptions);
+
+                            self.reload_profiles();
+                            state.subscriptions = self.subscriptions.clone();
+                            state.is_adding = false;
+                            state.status_message =
+                                Some(format!("Added '{}' with {} nodes", name, profiles.len()));
+                            state.error_message = None;
+                            self.active_modal = ActiveModal::SubscriptionManager(state);
+                        }
+                        Err(e) => {
+                            state.error_message = Some(format!("Failed to fetch feed: {}", e));
+                            self.active_modal = ActiveModal::SubscriptionManager(state);
+                        }
+                    }
+                }
+                KeyCode::Enter if !state.is_adding => {
+                    if !self.subscriptions.is_empty() && state.selected_idx < self.subscriptions.len() {
+                        match self.sync_subscription_by_idx(state.selected_idx).await {
+                            Ok(count) => {
+                                state.subscriptions = self.subscriptions.clone();
+                                state.status_message =
+                                    Some(format!("Synced {} nodes successfully", count));
+                                state.error_message = None;
+                            }
+                            Err(e) => {
+                                state.error_message = Some(format!("Sync failed: {}", e));
+                                state.status_message = None;
+                            }
+                        }
+                    }
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
+                }
+                _ => {
+                    self.active_modal = ActiveModal::SubscriptionManager(state);
                 }
             },
             ActiveModal::None => match code {
@@ -2338,7 +2849,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         Ok(())
     }
 
-    pub fn submit_config_adder(&mut self, mut adder: ConfigAdderState) -> Result<()> {
+    pub async fn submit_config_adder(&mut self, mut adder: ConfigAdderState) -> Result<()> {
         let group_opt = adder.resolved_group();
         if let Some(ref g) = group_opt
             && !self.custom_folders.contains(g)
@@ -2515,6 +3026,181 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::ConfigAdder(adder);
                 }
             }
+            VpnProtocol::V2Ray => {
+                let name = adder.v2_name.trim();
+                let link = adder.v2_link.trim();
+                let config_path = adder.v2_config_path.trim();
+
+                if name.is_empty() && link.is_empty() && config_path.is_empty() {
+                    adder.error_msg = Some(
+                        "Please provide a profile name or share link / config file".to_string(),
+                    );
+                    self.active_modal = ActiveModal::ConfigAdder(adder);
+                    return Ok(());
+                }
+
+                let mut proxy_endpoint = None;
+                let mut derived_name = name.to_string();
+                let mut endpoint_str = "127.0.0.1:10808".to_string();
+
+                if !link.is_empty() {
+                    if link.starts_with("http://") || link.starts_with("https://") {
+                        let folder_name = if let Some(ref g) = group_opt {
+                            g.clone()
+                        } else if !name.is_empty() {
+                            name.to_string()
+                        } else {
+                            "Subscription".to_string()
+                        };
+
+                        match fetch_subscription_feed(link).await {
+                            Ok(body) => {
+                                let profiles = parse_subscription_profiles(
+                                    &body,
+                                    &folder_name,
+                                    adder.v2_routing_mode,
+                                    adder.v2_core,
+                                );
+                                if profiles.is_empty() {
+                                    adder.error_msg = Some(
+                                        "No valid proxy nodes found in subscription feed"
+                                            .to_string(),
+                                    );
+                                    self.active_modal = ActiveModal::ConfigAdder(adder);
+                                    return Ok(());
+                                }
+
+                                if adder.v2_save_as_subscription {
+                                    let sub_name = if !name.is_empty() {
+                                        name.to_string()
+                                    } else {
+                                        folder_name.clone()
+                                    };
+                                    let mut sub = Subscription::new(&sub_name, link, &folder_name)
+                                        .with_routing_mode(adder.v2_routing_mode)
+                                        .with_core_pref(adder.v2_core);
+                                    sub.last_synced = Some(current_timestamp_string());
+
+                                    if let Some(pos) = self
+                                        .subscriptions
+                                        .iter()
+                                        .position(|s| s.url == link || s.id == sub.id)
+                                    {
+                                        self.subscriptions[pos] = sub;
+                                    } else {
+                                        self.subscriptions.push(sub);
+                                    }
+                                    let _ = self.storage.save_subscriptions(&self.subscriptions);
+                                }
+
+                                for prof in &profiles {
+                                    self.storage.save_profile(prof)?;
+                                }
+                                self.ensure_custom_folder(&folder_name);
+                                self.expanded_folders.insert(folder_name.clone());
+                                self.reload_profiles();
+                                self.add_log(format!(
+                                    "Imported {} proxy profiles from subscription into '{}'.",
+                                    profiles.len(),
+                                    folder_name
+                                ));
+                                self.active_modal = ActiveModal::None;
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                adder.error_msg =
+                                    Some(format!("Failed to fetch subscription: {}", e));
+                                self.active_modal = ActiveModal::ConfigAdder(adder);
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    match crate::domain::proxy_link::parse_share_link(link) {
+                        Ok((parsed_endpoint, opt_name)) => {
+                            endpoint_str =
+                                format!("{}:{}", parsed_endpoint.server, parsed_endpoint.port);
+                            if derived_name.is_empty() {
+                                if let Some(n) = opt_name {
+                                    derived_name = n;
+                                } else {
+                                    derived_name = format!(
+                                        "{}-{}",
+                                        parsed_endpoint
+                                            .protocol_type
+                                            .map(|t| t.display_name())
+                                            .unwrap_or("Proxy"),
+                                        parsed_endpoint.port
+                                    );
+                                }
+                            }
+                            proxy_endpoint = Some(parsed_endpoint);
+                        }
+                        Err(e) => {
+                            adder.error_msg = Some(format!("Invalid share link: {}", e));
+                            self.active_modal = ActiveModal::ConfigAdder(adder);
+                            return Ok(());
+                        }
+                    }
+                }
+
+                if derived_name.is_empty() {
+                    if !config_path.is_empty() {
+                        let p = std::path::Path::new(config_path);
+                        derived_name = p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("v2ray-config")
+                            .to_string();
+                    } else {
+                        derived_name = "V2Ray Profile".to_string();
+                    }
+                }
+
+                let cfg_file = if !config_path.is_empty() {
+                    Some(std::path::PathBuf::from(config_path))
+                } else {
+                    None
+                };
+
+                let mut prof = Profile::new_v2ray(&derived_name, &endpoint_str, cfg_file)
+                    .with_proxy_routing_mode(adder.v2_routing_mode)
+                    .with_proxy_core(adder.v2_core);
+
+                if let Some(id) = adder.editing_profile_id.clone() {
+                    prof.id = id;
+                }
+                prof.group = group_opt.clone();
+                if let Some(endpoint) = proxy_endpoint {
+                    prof.proxy_endpoint = Some(endpoint);
+                }
+                for f in adder.v2_custom_flags.split_whitespace() {
+                    prof = prof.with_flag(f);
+                }
+                if let Some(idx) = adder.account_idx
+                    && let Some(acc) = self.accounts.get(idx)
+                {
+                    prof = prof.with_account(acc.id.clone());
+                }
+
+                if let Some(ref g) = prof.group {
+                    let mut acc = String::new();
+                    for seg in g.split('/') {
+                        let seg = seg.trim();
+                        if !seg.is_empty() {
+                            if !acc.is_empty() {
+                                acc.push('/');
+                            }
+                            acc.push_str(seg);
+                            self.expanded_folders.insert(acc.clone());
+                        }
+                    }
+                }
+
+                self.storage.save_profile(&prof)?;
+                self.profiles = self.storage.load_profiles(None).unwrap_or_default();
+                self.active_modal = ActiveModal::None;
+            }
         }
         Ok(())
     }
@@ -2673,7 +3359,7 @@ mod tests {
         adder.oc_no_dtls = true;
         adder.oc_custom_flags = "--cafile=/etc/cert.pem".into();
 
-        app.submit_config_adder(adder).unwrap();
+        app.submit_config_adder(adder).await.unwrap();
 
         assert_eq!(app.active_modal, ActiveModal::None);
         let prof = app
@@ -2734,7 +3420,7 @@ mod tests {
         adder.oc_name = "Strict Profile".into();
         adder.oc_endpoint = "strict.vpn.corp:443".into();
         adder.ssl_policy = SslPolicy::Strict;
-        app.submit_config_adder(adder).unwrap();
+        app.submit_config_adder(adder).await.unwrap();
 
         let prof = app
             .profiles
@@ -2763,7 +3449,7 @@ mod tests {
         adder.ovpn_dev_tun = true;
         adder.ovpn_custom_flags = "--verb 4".into();
 
-        app.submit_config_adder(adder).unwrap();
+        app.submit_config_adder(adder).await.unwrap();
 
         assert_eq!(app.active_modal, ActiveModal::None);
         let prof = app
@@ -2776,6 +3462,48 @@ mod tests {
         assert!(
             prof.flags.contains(&"--verb".to_string()) || prof.flags.contains(&"4".to_string())
         );
+    }
+
+    #[tokio::test]
+    pub async fn test_app_config_submit_v2ray_valid_and_invalid_links() {
+        let mut app = setup_app();
+
+        // 1. Test invalid share link is rejected
+        let mut adder = ConfigAdderState::new(None);
+        adder.protocol = VpnProtocol::V2Ray;
+        adder.v2_name = "Bad Link Profile".into();
+        adder.v2_link = "invalid://bad-uri".into();
+
+        app.submit_config_adder(adder).await.unwrap();
+        match &app.active_modal {
+            ActiveModal::ConfigAdder(st) => {
+                assert!(st.error_msg.is_some());
+                assert!(st.error_msg.as_ref().unwrap().contains("Invalid share link"));
+            }
+            other => panic!("Expected ConfigAdder modal with error, got {:?}", other),
+        }
+
+        // 2. Test valid VLESS share link is successfully saved
+        let mut adder = ConfigAdderState::new(None);
+        adder.protocol = VpnProtocol::V2Ray;
+        adder.v2_name = "Good VLESS".into();
+        adder.v2_link = "vless://96c8d350-f80e-4361-9f93-549b6d65c3bb@sg.node.net:443?type=ws&security=reality&sni=sg.node.net#SG-Node".into();
+        adder.v2_routing_mode = ProxyRoutingMode::Tun;
+        adder.v2_core = ProxyCore::SingBox;
+
+        app.submit_config_adder(adder).await.unwrap();
+        assert_eq!(app.active_modal, ActiveModal::None);
+
+        let prof = app
+            .profiles
+            .iter()
+            .find(|p| p.name == "Good VLESS")
+            .expect("V2Ray profile saved");
+        assert_eq!(prof.protocol, VpnProtocol::V2Ray);
+        assert_eq!(prof.endpoint, "sg.node.net:443");
+        assert_eq!(prof.proxy_routing_mode, ProxyRoutingMode::Tun);
+        assert_eq!(prof.proxy_core, ProxyCore::SingBox);
+        assert!(prof.proxy_endpoint.is_some());
     }
 
     #[tokio::test]
@@ -2887,7 +3615,7 @@ mod tests {
         // Submit edit with changed endpoint
         let mut edited_adder = adder;
         edited_adder.oc_endpoint = "vpn.updated-frankfurt.com:443".into();
-        app.submit_config_adder(edited_adder).unwrap();
+        app.submit_config_adder(edited_adder).await.unwrap();
 
         assert_eq!(app.profiles.len(), 1);
         assert_eq!(app.profiles[0].endpoint, "vpn.updated-frankfurt.com:443");
@@ -3737,6 +4465,91 @@ mod tests {
         app.handle_key(KeyCode::Char('G')).await.unwrap();
         assert_eq!(app.logs_scroll_offset, 0);
         assert!(app.logs_auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_subscription_manager_modal_navigation_and_actions() {
+        use crossterm::event::KeyCode;
+
+        let mut storage = InMemoryStorage::new();
+        let sub = Subscription::new("Initial Sub", "https://mysub.net/feed", "SubFolder");
+        storage.save_subscriptions(&[sub]).unwrap();
+
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        // Press 'S' to open SyncManager
+        app.handle_key(KeyCode::Char('S')).await.unwrap();
+        assert!(matches!(app.active_modal, ActiveModal::SyncManager(_)));
+
+        // Down 3 times to select method 3: [4] V2Ray Subscriptions
+        app.handle_key(KeyCode::Down).await.unwrap();
+        app.handle_key(KeyCode::Down).await.unwrap();
+        app.handle_key(KeyCode::Down).await.unwrap();
+
+        // Hit Enter to enter SubscriptionManager
+        app.handle_key(KeyCode::Enter).await.unwrap();
+        match &app.active_modal {
+            ActiveModal::SubscriptionManager(st) => {
+                assert!(!st.is_adding);
+                assert_eq!(st.subscriptions.len(), 1);
+                assert_eq!(st.subscriptions[0].name, "Initial Sub");
+            }
+            other => panic!("Expected SubscriptionManager, got {:?}", other),
+        }
+
+        // Press 'a' to enter adding mode
+        app.handle_key(KeyCode::Char('a')).await.unwrap();
+        if let ActiveModal::SubscriptionManager(st) = &app.active_modal {
+            assert!(st.is_adding);
+            assert_eq!(st.add_field_idx, 0);
+        } else {
+            panic!("Expected is_adding = true");
+        }
+
+        // Cancel adding mode with Esc
+        app.handle_key(KeyCode::Esc).await.unwrap();
+        if let ActiveModal::SubscriptionManager(st) = &app.active_modal {
+            assert!(!st.is_adding);
+        }
+
+        // Delete subscription with 'd'
+        app.handle_key(KeyCode::Char('d')).await.unwrap();
+        if let ActiveModal::SubscriptionManager(st) = &app.active_modal {
+            assert_eq!(st.subscriptions.len(), 0);
+            assert!(st.status_message.as_ref().unwrap().contains("Deleted subscription"));
+        }
+
+        // Press Esc to exit back to SyncManager
+        app.handle_key(KeyCode::Esc).await.unwrap();
+        assert!(matches!(app.active_modal, ActiveModal::SyncManager(_)));
+    }
+
+    #[tokio::test]
+    async fn test_config_adder_v2ray_subscription_mode_toggle() {
+        use crossterm::event::KeyCode;
+
+        let mut adder = ConfigAdderState::new(None);
+        adder.protocol = VpnProtocol::V2Ray;
+        assert_eq!(adder.total_fields(), 8);
+
+        // Setting an HTTP URL expands total_fields to 9
+        adder.v2_link = "https://mysub.provider/feed".into();
+        assert_eq!(adder.total_fields(), 9);
+
+        // Field 8 is the managed subscription toggle
+        adder.field_idx = 8;
+        assert!(adder.v2_save_as_subscription);
+
+        // Toggle with Space
+        let mut app = setup_app();
+        app.active_modal = ActiveModal::ConfigAdder(adder);
+        app.handle_key(KeyCode::Char(' ')).await.unwrap();
+
+        if let ActiveModal::ConfigAdder(st) = &app.active_modal {
+            assert!(!st.v2_save_as_subscription);
+        } else {
+            panic!("Expected ConfigAdder modal");
+        }
     }
 }
 

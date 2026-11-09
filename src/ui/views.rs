@@ -521,6 +521,7 @@ fn render_profiles_list<S: ConfigStorage, R: VpnRunner, P: Pinger>(
                         let proto_badge = match prof.protocol {
                             crate::domain::config::VpnProtocol::OpenConnect => "[OC]",
                             crate::domain::config::VpnProtocol::OpenVpn => "[OV]",
+                            crate::domain::config::VpnProtocol::V2Ray => "[V2]",
                         };
 
                         let (latency_badge, latency_style) = match &prof.latency {
@@ -668,6 +669,22 @@ pub fn render_details_pane<S: ConfigStorage, R: VpnRunner, P: Pinger>(
             lines.push(Line::from(vec![
                 Span::styled("OVPN Config: ", theme.footer_key),
                 Span::styled(path.to_string_lossy().to_string(), theme.footer_desc),
+            ]));
+        } else if let Some(path) = &prof.proxy_config_file {
+            lines.push(Line::from(vec![
+                Span::styled("JSON Config: ", theme.footer_key),
+                Span::styled(path.to_string_lossy().to_string(), theme.footer_desc),
+                Span::raw("   |   "),
+                Span::styled("Mode: ", theme.footer_key),
+                Span::styled(prof.proxy_routing_mode.display_name(), theme.text),
+            ]));
+        } else if prof.protocol == crate::domain::config::VpnProtocol::V2Ray {
+            lines.push(Line::from(vec![
+                Span::styled("Routing Mode: ", theme.footer_key),
+                Span::styled(prof.proxy_routing_mode.display_name(), theme.text),
+                Span::raw("   |   "),
+                Span::styled("Core: ", theme.footer_key),
+                Span::styled(prof.proxy_core.display_name(), theme.footer_desc),
             ]));
         } else {
             lines.push(Line::from(vec![
@@ -1131,5 +1148,28 @@ mod tests {
         // Scrollbar up/down arrows appear
         assert!(content.contains("▲"));
         assert!(content.contains("▼"));
+    }
+
+    #[test]
+    fn test_render_v2ray_profile_badge_and_details() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut storage = InMemoryStorage::new();
+        let prof = Profile::new_v2ray("Tokyo VLESS", "tokyo.node.io:443", None)
+            .with_proxy_routing_mode(crate::domain::config::ProxyRoutingMode::Tun)
+            .with_proxy_core(crate::domain::config::ProxyCore::SingBox);
+        storage.save_profile(&prof).unwrap();
+
+        let app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+        terminal.draw(|f| render_ui(f, &app)).unwrap();
+
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("[V2]"));
+        assert!(content.contains("Tokyo VLESS"));
+        assert!(content.contains("Protocol:"));
+        assert!(content.contains("V2Ray"));
+        assert!(content.contains("Routing Mode:"));
+        assert!(content.contains("TUN (Full VPN)"));
     }
 }

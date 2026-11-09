@@ -64,6 +64,9 @@ pub fn render_modal(
         ActiveModal::BatchInput(batch_state) => {
             render_batch_input_modal(f, batch_state, accounts, theme);
         }
+        ActiveModal::SubscriptionManager(sub_state) => {
+            render_subscription_manager_modal(f, sub_state, theme);
+        }
     }
 }
 
@@ -430,6 +433,91 @@ pub fn render_config_adder_modal(
             }
             lines.push(Line::from(folder_spans));
         }
+        crate::domain::config::VpnProtocol::V2Ray => {
+            // Field 2: Profile Name
+            lines.push(Line::from(vec![
+                Span::styled(cursor(2), theme.footer_key),
+                Span::styled("Profile Name:   ", field_style(2)),
+                Span::raw(format!("{}_", adder.v2_name)),
+            ]));
+            lines.push(Line::raw(""));
+
+            // Field 3: Share Link / Subscription URL
+            lines.push(Line::from(vec![
+                Span::styled(cursor(3), theme.footer_key),
+                Span::styled("Share / Sub URL:", field_style(3)),
+                Span::raw(format!(" {}_", adder.v2_link)),
+                Span::styled(
+                    "  (vmess://, vless://, trojan://, ss://, http://, https://)",
+                    theme.footer_desc,
+                ),
+            ]));
+            lines.push(Line::raw(""));
+
+            // Field 4: JSON Config Path
+            lines.push(Line::from(vec![
+                Span::styled(cursor(4), theme.footer_key),
+                Span::styled("JSON Config:    ", field_style(4)),
+                Span::raw(format!("{}_", adder.v2_config_path)),
+                Span::styled("  [Tab: Complete | F2: Browse]", theme.footer_desc),
+            ]));
+            lines.push(Line::raw(""));
+
+            // Field 5: Routing Mode
+            lines.push(Line::from(vec![
+                Span::styled(cursor(5), theme.footer_key),
+                Span::styled("Routing Mode:   ", field_style(5)),
+                Span::raw(format!("< {} >", adder.v2_routing_mode.display_name())),
+                Span::styled("  (Space/←/→ to toggle)", theme.footer_desc),
+            ]));
+            lines.push(Line::raw(""));
+
+            // Field 6: Core Engine
+            lines.push(Line::from(vec![
+                Span::styled(cursor(6), theme.footer_key),
+                Span::styled("Core Engine:    ", field_style(6)),
+                Span::raw(format!("< {} >", adder.v2_core.display_name())),
+                Span::styled("  (Space/←/→ to cycle)", theme.footer_desc),
+            ]));
+            lines.push(Line::raw(""));
+
+            // Field 7: Folder / Group
+            let folder_display = if adder.is_on_new_folder() {
+                format!("[+ New Folder]: {}_", adder.custom_group_input)
+            } else {
+                adder.selected_folder_display().to_string()
+            };
+            let mut folder_spans = vec![
+                Span::styled(cursor(7), theme.footer_key),
+                Span::styled("Folder / Group: ", field_style(7)),
+            ];
+            if adder.is_on_new_folder() {
+                folder_spans.push(Span::raw(folder_display));
+                folder_spans.push(Span::styled("  (Type folder name)", theme.footer_desc));
+            } else {
+                folder_spans.push(Span::raw(format!("< {} >", folder_display)));
+                folder_spans.push(Span::styled("  (Space/←/→ to cycle)", theme.footer_desc));
+            }
+            lines.push(Line::from(folder_spans));
+
+            if adder.v2_link.starts_with("http://") || adder.v2_link.starts_with("https://") {
+                lines.push(Line::raw(""));
+                let check = if adder.v2_save_as_subscription {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(cursor(8), theme.footer_key),
+                    Span::styled("Subscription:   ", field_style(8)),
+                    Span::styled(
+                        format!("{} Save as Managed Subscription", check),
+                        theme.text,
+                    ),
+                    Span::styled("  (Space to toggle)", theme.footer_desc),
+                ]));
+            }
+        }
     }
 
     if let Some(err) = &adder.error_msg {
@@ -446,7 +534,9 @@ pub fn render_config_adder_modal(
         Span::styled("[Space]", theme.footer_key),
         Span::raw(" Toggle   "),
     ];
-    if adder.protocol == crate::domain::config::VpnProtocol::OpenVpn {
+    if adder.protocol == crate::domain::config::VpnProtocol::OpenVpn
+        || adder.protocol == crate::domain::config::VpnProtocol::V2Ray
+    {
         footer_spans.push(Span::styled("[F2]", theme.footer_key));
         footer_spans.push(Span::raw(" Browse   "));
     }
@@ -721,6 +811,10 @@ pub fn render_sync_manager_modal(
             "[3] Batch Paste Server IPs",
             "Paste raw list of server names and endpoints",
         ),
+        (
+            "[4] V2Ray Subscriptions",
+            "Manage & manually update V2Ray/Sing-box subscription feeds",
+        ),
     ];
 
     let mut lines = Vec::new();
@@ -746,26 +840,33 @@ pub fn render_sync_manager_modal(
         "────────────────────────────────────────────────────────────────",
     ));
 
-    let target_acc_name = accounts
-        .get(sync_state.target_account_idx)
-        .map(|a| a.name.as_str())
-        .unwrap_or("No Account Linked");
-    lines.push(Line::from(vec![
-        Span::styled("Target Account: ", theme.footer_key),
-        Span::styled(
-            format!("[ {} ] (Tab to cycle)", target_acc_name),
-            theme.text,
-        ),
-    ]));
+    if sync_state.selected_method_idx == 3 {
+        lines.push(Line::from(vec![
+            Span::styled("Subscription Feed Manager: ", theme.footer_key),
+            Span::styled("Press [Enter] to open Subscription Manager", theme.text),
+        ]));
+    } else {
+        let target_acc_name = accounts
+            .get(sync_state.target_account_idx)
+            .map(|a| a.name.as_str())
+            .unwrap_or("No Account Linked");
+        lines.push(Line::from(vec![
+            Span::styled("Target Account: ", theme.footer_key),
+            Span::styled(
+                format!("[ {} ] (Tab to cycle)", target_acc_name),
+                theme.text,
+            ),
+        ]));
 
-    let cisco_check = if sync_state.with_cisco { "[x]" } else { "[ ]" };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{} ", cisco_check), theme.connected),
-        Span::styled(
-            "Auto-generate Cisco OpenConnect profiles from OpenVPN remotes (Space to toggle)",
-            theme.footer_desc,
-        ),
-    ]));
+        let cisco_check = if sync_state.with_cisco { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", cisco_check), theme.connected),
+            Span::styled(
+                "Auto-generate Cisco OpenConnect profiles from OpenVPN remotes (Space to toggle)",
+                theme.footer_desc,
+            ),
+        ]));
+    }
 
     if let Some(ref msg) = sync_state.status_message {
         lines.push(Line::raw(""));
@@ -867,6 +968,197 @@ pub fn render_batch_input_modal(
     f.render_widget(p, area);
 }
 
+pub fn render_subscription_manager_modal(
+    f: &mut Frame,
+    sub_state: &crate::app::SubscriptionManagerState,
+    theme: &Theme,
+) {
+    let area = centered_rect(70, 60, f.area());
+    f.render_widget(Clear, area);
+
+    let title = if sub_state.is_adding {
+        " Add V2Ray Subscription "
+    } else {
+        " V2Ray Subscription Manager "
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_active)
+        .title(title);
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if sub_state.is_adding {
+        let field_style = |idx| {
+            if idx == sub_state.add_field_idx {
+                theme.footer_key
+            } else {
+                theme.text
+            }
+        };
+        let cursor = |idx| {
+            if idx == sub_state.add_field_idx {
+                "▶ "
+            } else {
+                "  "
+            }
+        };
+
+        let mut lines = Vec::new();
+        lines.push(Line::styled(
+            "Enter remote subscription URL and options:",
+            theme.footer_desc,
+        ));
+        lines.push(Line::raw(""));
+
+        // Field 0: Name
+        lines.push(Line::from(vec![
+            Span::styled(cursor(0), theme.footer_key),
+            Span::styled("Name:         ", field_style(0)),
+            Span::raw(format!("{}_", sub_state.add_name)),
+        ]));
+        lines.push(Line::raw(""));
+
+        // Field 1: URL
+        lines.push(Line::from(vec![
+            Span::styled(cursor(1), theme.footer_key),
+            Span::styled("Feed URL:     ", field_style(1)),
+            Span::raw(format!("{}_", sub_state.add_url)),
+            Span::styled("  (http:// or https://)", theme.footer_desc),
+        ]));
+        lines.push(Line::raw(""));
+
+        // Field 2: Target Folder
+        lines.push(Line::from(vec![
+            Span::styled(cursor(2), theme.footer_key),
+            Span::styled("Target Folder:", field_style(2)),
+            Span::raw(format!(" {}_", sub_state.add_folder)),
+        ]));
+        lines.push(Line::raw(""));
+
+        // Field 3: Routing Mode
+        lines.push(Line::from(vec![
+            Span::styled(cursor(3), theme.footer_key),
+            Span::styled("Routing Mode: ", field_style(3)),
+            Span::raw(format!("< {} >", sub_state.add_routing_mode.display_name())),
+            Span::styled("  (Space to toggle)", theme.footer_desc),
+        ]));
+        lines.push(Line::raw(""));
+
+        // Field 4: Core Engine
+        lines.push(Line::from(vec![
+            Span::styled(cursor(4), theme.footer_key),
+            Span::styled("Core Engine:  ", field_style(4)),
+            Span::raw(format!("< {} >", sub_state.add_core_pref.display_name())),
+            Span::styled("  (Space to cycle)", theme.footer_desc),
+        ]));
+
+        if let Some(ref err) = sub_state.error_message {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(format!("Error: {}", err), theme.failed));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(
+            "────────────────────────────────────────────────────────────────",
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("[Tab/↓]", theme.footer_key),
+            Span::raw(" Next   "),
+            Span::styled("[BackTab/↑]", theme.footer_key),
+            Span::raw(" Prev   "),
+            Span::styled("[Enter]", theme.footer_key),
+            Span::raw(" Fetch & Save   "),
+            Span::styled("[Esc]", theme.footer_key),
+            Span::raw(" Cancel"),
+        ]));
+
+        let paragraph = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true });
+        f.render_widget(paragraph, inner);
+    } else {
+        let mut lines = Vec::new();
+        if sub_state.subscriptions.is_empty() {
+            lines.push(Line::styled(
+                "No managed subscriptions yet.",
+                theme.footer_desc,
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Press 'a' to add a new subscription feed.",
+                theme.footer_key,
+            ));
+        } else {
+            lines.push(Line::styled(
+                "Managed Subscriptions (Manual Sync Only):",
+                theme.footer_key,
+            ));
+            lines.push(Line::raw(""));
+
+            for (i, sub) in sub_state.subscriptions.iter().enumerate() {
+                let is_sel = i == sub_state.selected_idx;
+                let marker = if is_sel { "▶ " } else { "  " };
+                let style = if is_sel { theme.highlight } else { theme.text };
+                let sync_time = sub.last_synced.as_deref().unwrap_or("Never synced");
+
+                lines.push(Line::from(vec![
+                    Span::styled(marker, theme.footer_key),
+                    Span::styled(&sub.name, style),
+                    Span::styled(format!("  [Folder: {}]", sub.folder), theme.footer_desc),
+                ]));
+                lines.push(Line::styled(
+                    format!(
+                        "    Mode: {} | Core: {} | Last: {}",
+                        sub.routing_mode, sub.core_pref, sync_time
+                    ),
+                    theme.footer_desc,
+                ));
+                let display_url = if sub.url.len() > 55 {
+                    format!("{}...", &sub.url[..52])
+                } else {
+                    sub.url.clone()
+                };
+                lines.push(Line::styled(
+                    format!("    URL: {}", display_url),
+                    theme.footer_desc,
+                ));
+                lines.push(Line::raw(""));
+            }
+        }
+
+        if let Some(ref msg) = sub_state.status_message {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(msg, theme.connected));
+        }
+        if let Some(ref err) = sub_state.error_message {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(err, theme.failed));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(
+            "────────────────────────────────────────────────────────────────",
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("[u/Enter]", theme.footer_key),
+            Span::raw(" Sync Sel   "),
+            Span::styled("[U]", theme.footer_key),
+            Span::raw(" Sync All   "),
+            Span::styled("[a]", theme.footer_key),
+            Span::raw(" Add   "),
+            Span::styled("[d]", theme.footer_key),
+            Span::raw(" Delete   "),
+            Span::styled("[Esc]", theme.footer_key),
+            Span::raw(" Back"),
+        ]));
+
+        let paragraph = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true });
+        f.render_widget(paragraph, inner);
+    }
+}
+
 #[cfg(test)]
 pub mod config_adder {
     use super::*;
@@ -947,6 +1239,56 @@ pub mod config_adder {
         let buffer = format!("{:?}", terminal.backend().buffer());
         assert!(buffer.contains("BioVPN/Cisco"));
         assert!(buffer.contains("Space/←/→ to cycle"));
+    }
+
+    #[test]
+    fn test_render_config_adder_modal_v2ray() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+
+        let mut adder = ConfigAdderState::new(None);
+        adder.protocol = VpnProtocol::V2Ray;
+        adder.v2_name = "My V2Ray".into();
+        adder.v2_link = "vmess://eyJhZGQiOiI...".into();
+
+        terminal
+            .draw(|f| {
+                render_config_adder_modal(f, &adder, &[], &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("New Configuration (V2Ray)"));
+        assert!(buffer.contains("Share / Sub URL:"));
+        assert!(buffer.contains("JSON Config:"));
+        assert!(buffer.contains("Routing Mode:"));
+        assert!(buffer.contains("System Proxy"));
+        assert!(buffer.contains("Core Engine:"));
+        assert!(buffer.contains("Auto-detect"));
+    }
+
+    #[test]
+    fn test_render_config_adder_modal_v2ray_subscription() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+
+        let mut adder = ConfigAdderState::new(None);
+        adder.protocol = VpnProtocol::V2Ray;
+        adder.v2_name = "Sub Node".into();
+        adder.v2_link = "https://mysub.site/feed".into();
+        adder.v2_save_as_subscription = true;
+
+        terminal
+            .draw(|f| {
+                render_config_adder_modal(f, &adder, &[], &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("Save as Managed Subscription"));
+        assert!(buffer.contains("[x]"));
     }
 }
 
@@ -1261,6 +1603,33 @@ pub mod sync_manager {
         assert!(buffer.contains("Batch Add Servers"));
         assert!(buffer.contains("Germany 185.120.45.10"));
         assert!(buffer.contains("Netherlands 45.93.169.132"));
+    }
+
+    #[test]
+    fn test_render_subscription_manager_modal() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+
+        let sub = crate::domain::subscription::Subscription::new(
+            "VIP Nodes",
+            "https://vip.sub/feed",
+            "VIPFolder",
+        );
+        let mut state = crate::app::SubscriptionManagerState::new(vec![sub]);
+        state.status_message = Some("Synced successfully".to_string());
+
+        terminal
+            .draw(|f| {
+                render_subscription_manager_modal(f, &state, &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("V2Ray Subscription Manager"));
+        assert!(buffer.contains("VIP Nodes"));
+        assert!(buffer.contains("VIPFolder"));
+        assert!(buffer.contains("Synced successfully"));
     }
 
     #[test]

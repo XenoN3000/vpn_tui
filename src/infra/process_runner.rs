@@ -1,25 +1,148 @@
 use crate::domain::account::Credentials;
-use crate::domain::config::{Profile, SslPolicy, VpnProtocol};
+use crate::domain::config::{Profile, ProxyCore, ProxyRoutingMode, SslPolicy, VpnProtocol};
 use crate::domain::flags::{build_openconnect_args, build_openvpn_args};
 use crate::ports::vpn_runner::{CertProbeResult, LogEvent, VpnRunner};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+pub fn find_binary_in_path(name: &str) -> bool {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let bin_path = dir.join(name);
+            if bin_path.is_file() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                let exe_path = dir.join(format!("{}.exe", name));
+                if exe_path.is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn resolve_proxy_binary(
+    preference: ProxyCore,
+    mode: ProxyRoutingMode,
+) -> Result<(&'static str, ProxyCore)> {
+    match preference {
+        ProxyCore::SingBox => {
+            if find_binary_in_path("sing-box") {
+                Ok(("sing-box", ProxyCore::SingBox))
+            } else {
+                anyhow::bail!("sing-box binary not found in PATH");
+            }
+        }
+        ProxyCore::Xray => {
+            if find_binary_in_path("xray") {
+                Ok(("xray", ProxyCore::Xray))
+            } else {
+                anyhow::bail!("xray binary not found in PATH");
+            }
+        }
+        ProxyCore::V2Ray => {
+            if find_binary_in_path("v2ray") {
+                Ok(("v2ray", ProxyCore::V2Ray))
+            } else {
+                anyhow::bail!("v2ray binary not found in PATH");
+            }
+        }
+        ProxyCore::Auto => {
+            if mode == ProxyRoutingMode::Tun {
+                if find_binary_in_path("sing-box") {
+                    return Ok(("sing-box", ProxyCore::SingBox));
+                }
+                if find_binary_in_path("xray") {
+                    return Ok(("xray", ProxyCore::Xray));
+                }
+                if find_binary_in_path("v2ray") {
+                    return Ok(("v2ray", ProxyCore::V2Ray));
+                }
+            } else {
+                if find_binary_in_path("sing-box") {
+                    return Ok(("sing-box", ProxyCore::SingBox));
+                }
+                if find_binary_in_path("xray") {
+                    return Ok(("xray", ProxyCore::Xray));
+                }
+                if find_binary_in_path("v2ray") {
+                    return Ok(("v2ray", ProxyCore::V2Ray));
+                }
+            }
+            anyhow::bail!(
+                "No compatible proxy core found in PATH. Please install sing-box, xray, or v2ray."
+            );
+        }
+    }
+}
+
+pub fn set_desktop_proxy(http_port: u16, socks_port: u16) -> Result<()> {
+    if find_binary_in_path("gsettings") {
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy", "mode", "manual"])
+            .status();
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.http", "host", "127.0.0.1"])
+            .status();
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.http", "port", &http_port.to_string()])
+            .status();
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.https", "host", "127.0.0.1"])
+            .status();
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.https", "port", &http_port.to_string()])
+            .status();
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"])
+            .status();
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.socks", "port", &socks_port.to_string()])
+            .status();
+    }
+
+    let env_file_path = std::env::temp_dir().join("vpn_tui_proxy.env");
+    let env_content = format!(
+        "export http_proxy=\"http://127.0.0.1:{}\"\nexport https_proxy=\"http://127.0.0.1:{}\"\nexport all_proxy=\"socks5://127.0.0.1:{}\"\n",
+        http_port, http_port, socks_port
+    );
+    let _ = std::fs::write(env_file_path, env_content);
+    Ok(())
+}
+
+pub fn clear_desktop_proxy() -> Result<()> {
+    if find_binary_in_path("gsettings") {
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy", "mode", "none"])
+            .status();
+    }
+    let env_file_path = std::env::temp_dir().join("vpn_tui_proxy.env");
+    if env_file_path.exists() {
+        let _ = std::fs::remove_file(env_file_path);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SudoProcessRunner {
     active_pid: Arc<AtomicU32>,
+    is_proxy_mode: Arc<AtomicBool>,
 }
 
 impl SudoProcessRunner {
     pub fn new() -> Self {
         Self {
             active_pid: Arc::new(AtomicU32::new(0)),
+            is_proxy_mode: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -184,14 +307,14 @@ impl VpnRunner for SudoProcessRunner {
         sudo_password: Option<&str>,
         event_tx: mpsc::UnboundedSender<LogEvent>,
     ) -> Result<()> {
-        let (binary, args, stdin_data) = match profile.protocol {
+        let (use_sudo, binary, args, stdin_data) = match profile.protocol {
             VpnProtocol::OpenConnect => {
                 let has_password = creds.and_then(|c| c.password.as_deref()).is_some();
                 let args = build_openconnect_args(profile, creds, has_password);
                 let stdin_data = creds
                     .and_then(|c| c.password.as_deref())
                     .map(|p| format!("{}\n", p));
-                ("openconnect", args, stdin_data)
+                (true, "openconnect".to_string(), args, stdin_data)
             }
             VpnProtocol::OpenVpn => {
                 // Build auth-user-pass temporary file if credentials exist
@@ -215,20 +338,86 @@ impl VpnRunner for SudoProcessRunner {
                 };
 
                 let args = build_openvpn_args(profile, auth_file_path.as_deref());
-                ("openvpn", args, None)
+                (true, "openvpn".to_string(), args, None)
+            }
+            VpnProtocol::V2Ray => {
+                let (bin_name, chosen_core) =
+                    resolve_proxy_binary(profile.proxy_core, profile.proxy_routing_mode)?;
+
+                let config_path_buf = if let Some(ref path) = profile.proxy_config_file {
+                    path.clone()
+                } else if let Some(ref endpoint) = profile.proxy_endpoint {
+                    let runtime_json = crate::infra::proxy_config_gen::generate_runtime_config(
+                        chosen_core,
+                        endpoint,
+                        profile.proxy_routing_mode,
+                    )?;
+                    let tmp_path =
+                        std::env::temp_dir().join(format!("vpn_tui_v2ray_{}.json", profile.id.0));
+                    std::fs::write(&tmp_path, runtime_json)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &tmp_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                    tmp_path
+                } else {
+                    anyhow::bail!(
+                        "V2Ray profile has neither a config file nor an endpoint configuration"
+                    );
+                };
+
+                let config_arg = config_path_buf.to_string_lossy().to_string();
+                let mut proxy_args = vec!["run".to_string(), "-c".to_string(), config_arg];
+                for flag in &profile.flags {
+                    let trimmed = flag.trim();
+                    if !trimmed.is_empty() {
+                        for part in trimmed.split_whitespace() {
+                            proxy_args.push(part.to_string());
+                        }
+                    }
+                }
+
+                let use_sudo = profile.proxy_routing_mode == ProxyRoutingMode::Tun;
+                if profile.proxy_routing_mode == ProxyRoutingMode::SystemProxy {
+                    let _ = set_desktop_proxy(10809, 10808);
+                    self.is_proxy_mode.store(true, Ordering::SeqCst);
+                    let _ = event_tx.send(LogEvent::Stdout(
+                        "Local proxy listening on 127.0.0.1:10808 (SOCKS5) and 127.0.0.1:10809 (HTTP)".into(),
+                    ));
+                    let _ = event_tx.send(LogEvent::TunnelUp {
+                        interface: "proxy".into(),
+                        ip: Some("127.0.0.1".into()),
+                    });
+                } else {
+                    self.is_proxy_mode.store(false, Ordering::SeqCst);
+                }
+
+                (use_sudo, bin_name.to_string(), proxy_args, None)
             }
         };
 
-        // If sudo password is provided, verify it first
-        if let Some(pass) = sudo_password {
-            let valid = self.verify_sudo_password(pass).await;
-            if !valid {
-                anyhow::bail!("Invalid sudo password");
+        if use_sudo {
+            if let Some(pass) = sudo_password {
+                let valid = self.verify_sudo_password(pass).await;
+                if !valid {
+                    anyhow::bail!("Invalid sudo password");
+                }
             }
         }
 
-        let mut cmd = Command::new("sudo");
-        cmd.arg("-E").arg(binary).args(&args);
+        let mut cmd = if use_sudo {
+            let mut c = Command::new("sudo");
+            c.arg("-E").arg(&binary).args(&args);
+            c
+        } else {
+            let mut c = Command::new(&binary);
+            c.args(&args);
+            c
+        };
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -240,7 +429,7 @@ impl VpnRunner for SudoProcessRunner {
 
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("Failed to spawn sudo -E {}", binary))?;
+            .with_context(|| format!("Failed to spawn {}", binary))?;
 
         if let Some(pid) = child.id() {
             self.active_pid.store(pid, Ordering::SeqCst);
@@ -283,9 +472,13 @@ impl VpnRunner for SudoProcessRunner {
         }
 
         let pid_holder = self.active_pid.clone();
+        let proxy_mode_holder = self.is_proxy_mode.clone();
         tokio::spawn(async move {
             let status = child.wait().await;
             pid_holder.store(0, Ordering::SeqCst);
+            if proxy_mode_holder.swap(false, Ordering::SeqCst) {
+                let _ = clear_desktop_proxy();
+            }
             let code = status.map_or(-1, |s| s.code().unwrap_or(-1));
             let _ = event_tx.send(LogEvent::ProcessExited(code));
         });
@@ -301,6 +494,15 @@ impl VpnRunner for SudoProcessRunner {
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGINT);
             }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .status();
+            }
+        }
+        if self.is_proxy_mode.swap(false, Ordering::SeqCst) {
+            let _ = clear_desktop_proxy();
         }
         Ok(())
     }
@@ -453,5 +655,25 @@ Please enter your username and password.
         let runner = SudoProcessRunner::new();
         assert_eq!(runner.active_pid.load(Ordering::SeqCst), 0);
         assert!(runner.disconnect().await.is_ok());
+    }
+
+    #[test]
+    fn test_find_binary_in_path() {
+        // Standard unix binaries should exist in PATH
+        assert!(find_binary_in_path("sh") || find_binary_in_path("ls"));
+        assert!(!find_binary_in_path("non_existent_binary_xyz_123"));
+    }
+
+    #[test]
+    fn test_desktop_proxy_env_hooks() {
+        let _ = set_desktop_proxy(10809, 10808);
+        let env_file = std::env::temp_dir().join("vpn_tui_proxy.env");
+        assert!(env_file.exists());
+        let content = std::fs::read_to_string(&env_file).unwrap();
+        assert!(content.contains("http://127.0.0.1:10809"));
+        assert!(content.contains("socks5://127.0.0.1:10808"));
+
+        let _ = clear_desktop_proxy();
+        assert!(!env_file.exists());
     }
 }

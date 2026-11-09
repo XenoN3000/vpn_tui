@@ -157,7 +157,7 @@ async fn test_full_vpn_tui_lifecycle_e2e() {
     // Clear and update endpoint
     let mut updated_adder = adder;
     updated_adder.oc_endpoint = "vpn.tokyo-updated.corp:443".into();
-    app.submit_config_adder(updated_adder).unwrap();
+    app.submit_config_adder(updated_adder).await.unwrap();
 
     assert_eq!(app.profiles.len(), 4);
     let tokyo_prof = app

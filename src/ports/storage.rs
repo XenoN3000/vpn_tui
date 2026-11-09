@@ -1,5 +1,6 @@
 use crate::domain::account::{Account, AccountId};
 use crate::domain::config::{Profile, ProfileId, VpnProtocol};
+use crate::domain::subscription::Subscription;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,9 @@ pub trait ConfigStorage: Send + Sync {
 
     fn load_folders(&self) -> Result<Vec<String>>;
     fn save_folders(&mut self, folders: &[String]) -> Result<()>;
+
+    fn load_subscriptions(&self) -> Result<Vec<Subscription>>;
+    fn save_subscriptions(&mut self, subscriptions: &[Subscription]) -> Result<()>;
 }
 
 /// In-memory mock storage for unit testing.
@@ -27,6 +31,7 @@ pub struct InMemoryStorage {
     pub accounts: HashMap<AccountId, Account>,
     pub profiles: HashMap<ProfileId, Profile>,
     pub folders: Vec<String>,
+    pub subscriptions: Vec<Subscription>,
 }
 
 impl InMemoryStorage {
@@ -36,6 +41,7 @@ impl InMemoryStorage {
             accounts: HashMap::new(),
             profiles: HashMap::new(),
             folders: Vec::new(),
+            subscriptions: Vec::new(),
         }
     }
 }
@@ -97,11 +103,33 @@ impl ConfigStorage for InMemoryStorage {
         self.folders = folders.to_vec();
         Ok(())
     }
+
+    fn load_subscriptions(&self) -> Result<Vec<Subscription>> {
+        Ok(self.subscriptions.clone())
+    }
+
+    fn save_subscriptions(&mut self, subscriptions: &[Subscription]) -> Result<()> {
+        self.subscriptions = subscriptions.to_vec();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_in_memory_storage_subscription_crud() {
+        let mut storage = InMemoryStorage::new();
+        assert_eq!(storage.load_subscriptions().unwrap().len(), 0);
+
+        let sub = Subscription::new("Sub 1", "https://sub.url", "Folder 1");
+        storage.save_subscriptions(&[sub.clone()]).unwrap();
+
+        let subs = storage.load_subscriptions().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].name, "Sub 1");
+    }
 
     #[test]
     fn test_in_memory_storage_account_crud() {

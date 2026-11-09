@@ -1,5 +1,6 @@
 use crate::domain::account::{Account, AccountId};
 use crate::domain::config::{Profile, ProfileId, VpnProtocol};
+use crate::domain::subscription::Subscription;
 use crate::ports::storage::ConfigStorage;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,12 @@ struct AccountsManifest {
 struct FoldersManifest {
     #[serde(default)]
     pub folders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SubscriptionsManifest {
+    #[serde(default)]
+    pub subscriptions: Vec<Subscription>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,11 +81,16 @@ impl FsConfigStorage {
         self.root.join("folders.toml")
     }
 
+    pub fn subscriptions_file(&self) -> PathBuf {
+        self.root.join("subscriptions.toml")
+    }
+
     fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("Failed to create config root {:?}", self.root))?;
         fs::create_dir_all(self.protocol_dir(VpnProtocol::OpenConnect))?;
         fs::create_dir_all(self.protocol_dir(VpnProtocol::OpenVpn))?;
+        fs::create_dir_all(self.protocol_dir(VpnProtocol::V2Ray))?;
         Ok(())
     }
 }
@@ -130,7 +142,11 @@ impl ConfigStorage for FsConfigStorage {
 
         let protocols: Vec<VpnProtocol> = match protocol {
             Some(p) => vec![p],
-            None => vec![VpnProtocol::OpenConnect, VpnProtocol::OpenVpn],
+            None => vec![
+                VpnProtocol::OpenConnect,
+                VpnProtocol::OpenVpn,
+                VpnProtocol::V2Ray,
+            ],
         };
 
         for proto in protocols {
@@ -165,6 +181,20 @@ impl ConfigStorage for FsConfigStorage {
                             );
                             profiles.push(profile);
                         }
+                    } else if proto == VpnProtocol::V2Ray
+                        && path.extension().is_some_and(|ext| ext == "json")
+                    {
+                        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        let has_companion_toml = path.with_extension("toml").exists();
+                        let already_loaded = profiles.iter().any(|p| p.id.0 == stem);
+                        if !has_companion_toml && !already_loaded {
+                            let profile = Profile::new_v2ray(
+                                stem.to_string(),
+                                "custom-json",
+                                Some(path.clone()),
+                            );
+                            profiles.push(profile);
+                        }
                     }
                 }
             }
@@ -185,7 +215,11 @@ impl ConfigStorage for FsConfigStorage {
 
     fn delete_profile(&mut self, id: &ProfileId) -> Result<bool> {
         let mut removed = false;
-        for proto in [VpnProtocol::OpenConnect, VpnProtocol::OpenVpn] {
+        for proto in [
+            VpnProtocol::OpenConnect,
+            VpnProtocol::OpenVpn,
+            VpnProtocol::V2Ray,
+        ] {
             let dir = self.protocol_dir(proto);
             let toml_file = dir.join(format!("{}.toml", id.0));
             if toml_file.exists() {
@@ -196,6 +230,13 @@ impl ConfigStorage for FsConfigStorage {
                 let ovpn_file = dir.join(format!("{}.ovpn", id.0));
                 if ovpn_file.exists() {
                     fs::remove_file(ovpn_file)?;
+                    removed = true;
+                }
+            }
+            if proto == VpnProtocol::V2Ray {
+                let json_file = dir.join(format!("{}.json", id.0));
+                if json_file.exists() {
+                    fs::remove_file(json_file)?;
                     removed = true;
                 }
             }
@@ -251,6 +292,29 @@ impl ConfigStorage for FsConfigStorage {
         };
         let serialized = toml::to_string_pretty(&manifest)?;
         fs::write(self.folders_file(), serialized)?;
+        Ok(())
+    }
+
+    fn load_subscriptions(&self) -> Result<Vec<Subscription>> {
+        let file = self.subscriptions_file();
+        if !file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&file)
+            .with_context(|| format!("Failed to read subscriptions file {:?}", file))?;
+        let manifest: SubscriptionsManifest = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse subscriptions file {:?}", file))?;
+        Ok(manifest.subscriptions)
+    }
+
+    fn save_subscriptions(&mut self, subscriptions: &[Subscription]) -> Result<()> {
+        self.ensure_dirs()?;
+        let manifest = SubscriptionsManifest {
+            subscriptions: subscriptions.to_vec(),
+        };
+        let serialized = toml::to_string_pretty(&manifest)?;
+        fs::write(self.subscriptions_file(), serialized)?;
         Ok(())
     }
 }
@@ -356,5 +420,58 @@ mod tests {
         assert!(storage.folders_file().exists());
         let loaded = storage.load_folders().unwrap();
         assert_eq!(loaded, folders);
+    }
+
+    #[test]
+    fn test_fs_storage_v2ray_profile_and_json_detection() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        let v2_profile = Profile::new_v2ray("Tokyo V2", "tokyo.proxy.net:443", None);
+        storage.save_profile(&v2_profile).unwrap();
+
+        let loaded = storage.load_profiles(Some(VpnProtocol::V2Ray)).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Tokyo V2");
+        assert_eq!(loaded[0].protocol, VpnProtocol::V2Ray);
+
+        // Also test auto-detecting a standalone .json config in v2ray dir
+        let v2_dir = storage.protocol_dir(VpnProtocol::V2Ray);
+        let raw_json = v2_dir.join("standalone-server.json");
+        fs::write(&raw_json, "{\"inbounds\":[], \"outbounds\":[]}").unwrap();
+
+        let loaded_all = storage.load_profiles(Some(VpnProtocol::V2Ray)).unwrap();
+        assert_eq!(loaded_all.len(), 2);
+        assert!(loaded_all.iter().any(|p| p.name == "standalone-server"));
+
+        let deleted = storage.delete_profile(&v2_profile.id).unwrap();
+        assert!(deleted);
+        let remaining = storage.load_profiles(Some(VpnProtocol::V2Ray)).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "standalone-server");
+    }
+
+    #[test]
+    fn test_fs_storage_subscription_lifecycle() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        assert_eq!(storage.load_subscriptions().unwrap().len(), 0);
+
+        let sub1 = Subscription::new("Sub Alpha", "https://alpha.com/sub", "AlphaFolder");
+        let sub2 = Subscription::new("Sub Beta", "https://beta.com/sub", "BetaFolder");
+        storage.save_subscriptions(&[sub1.clone(), sub2.clone()]).unwrap();
+
+        assert!(storage.subscriptions_file().exists());
+        let loaded = storage.load_subscriptions().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Sub Alpha");
+        assert_eq!(loaded[1].name, "Sub Beta");
+
+        // Overwrite / update
+        storage.save_subscriptions(&[sub1]).unwrap();
+        let updated = storage.load_subscriptions().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].name, "Sub Alpha");
     }
 }
