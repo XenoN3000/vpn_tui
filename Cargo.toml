@@ -1,6 +1,6 @@
 [package]
 name = "vpn_tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "A terminal user interface for managing OpenConnect and OpenVPN connections on Linux"

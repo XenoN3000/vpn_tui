@@ -11,23 +11,39 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-pub fn find_binary_in_path(name: &str) -> bool {
+pub fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(name);
+    if p.is_absolute() && p.is_file() {
+        return Some(p.to_path_buf());
+    }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let bin_path = dir.join(name);
             if bin_path.is_file() {
-                return true;
+                return Some(bin_path);
             }
             #[cfg(windows)]
             {
                 let exe_path = dir.join(format!("{}.exe", name));
                 if exe_path.is_file() {
-                    return true;
+                    return Some(exe_path);
                 }
             }
         }
     }
-    false
+    None
+}
+
+pub fn find_binary_in_path(name: &str) -> bool {
+    find_binary_path(name).is_some()
+}
+
+pub fn resolve_executable_path(name: &str) -> String {
+    if let Some(path) = find_binary_path(name) {
+        path.to_string_lossy().to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 pub fn resolve_proxy_binary(
@@ -143,6 +159,19 @@ impl SudoProcessRunner {
         Self {
             active_pid: Arc::new(AtomicU32::new(0)),
             is_proxy_mode: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn build_execution_command(use_sudo: bool, binary: &str, args: &[String]) -> Command {
+        let target_bin = resolve_executable_path(binary);
+        if use_sudo {
+            let mut c = Command::new("sudo");
+            c.arg(&target_bin).args(args);
+            c
+        } else {
+            let mut c = Command::new(&target_bin);
+            c.args(args);
+            c
         }
     }
 
@@ -409,15 +438,7 @@ impl VpnRunner for SudoProcessRunner {
             }
         }
 
-        let mut cmd = if use_sudo {
-            let mut c = Command::new("sudo");
-            c.arg("-E").arg(&binary).args(&args);
-            c
-        } else {
-            let mut c = Command::new(&binary);
-            c.args(&args);
-            c
-        };
+        let mut cmd = SudoProcessRunner::build_execution_command(use_sudo, &binary, &args);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -524,7 +545,8 @@ impl VpnRunner for SudoProcessRunner {
             return CertProbeResult::Trusted;
         }
 
-        let mut cmd = Command::new("openconnect");
+        let openconnect_bin = resolve_executable_path("openconnect");
+        let mut cmd = Command::new(openconnect_bin);
         cmd.arg("--authenticate");
         let proto = profile
             .openconnect_protocol
@@ -662,6 +684,62 @@ Please enter your username and password.
         // Standard unix binaries should exist in PATH
         assert!(find_binary_in_path("sh") || find_binary_in_path("ls"));
         assert!(!find_binary_in_path("non_existent_binary_xyz_123"));
+    }
+
+    #[test]
+    fn test_find_binary_path_and_resolve_executable() {
+        let sh_path = find_binary_path("sh");
+        assert!(sh_path.is_some());
+        assert!(sh_path.unwrap().is_file());
+
+        let non_existent = find_binary_path("non_existent_binary_xyz_123");
+        assert!(non_existent.is_none());
+
+        let resolved_sh = resolve_executable_path("sh");
+        assert!(resolved_sh.contains("sh"));
+        assert!(std::path::Path::new(&resolved_sh).is_file());
+
+        let unresolved = resolve_executable_path("custom_binary_not_found");
+        assert_eq!(unresolved, "custom_binary_not_found");
+    }
+
+    #[test]
+    fn test_build_execution_command_privileged_no_preserve_env() {
+        let args = vec!["--server=vpn.corp.com".to_string(), "--user=alice".to_string()];
+        let cmd = SudoProcessRunner::build_execution_command(true, "sh", &args);
+        let std_cmd = cmd.as_std();
+
+        assert_eq!(std_cmd.get_program(), "sudo");
+        let collected_args: Vec<String> = std_cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        // Must not contain -E or --preserve-env
+        assert!(!collected_args.contains(&"-E".to_string()));
+        assert!(!collected_args.contains(&"--preserve-env".to_string()));
+
+        // Target binary should be resolved to its canonical path
+        assert!(collected_args[0].contains("sh"));
+        assert!(std::path::Path::new(&collected_args[0]).is_file());
+        assert_eq!(collected_args[1], "--server=vpn.corp.com");
+        assert_eq!(collected_args[2], "--user=alice");
+    }
+
+    #[test]
+    fn test_build_execution_command_unprivileged() {
+        let args = vec!["run".to_string(), "-c".to_string(), "config.json".to_string()];
+        let cmd = SudoProcessRunner::build_execution_command(false, "sh", &args);
+        let std_cmd = cmd.as_std();
+
+        assert_ne!(std_cmd.get_program(), "sudo");
+        assert!(std_cmd.get_program().to_string_lossy().contains("sh"));
+
+        let collected_args: Vec<String> = std_cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(collected_args, vec!["run", "-c", "config.json"]);
     }
 
     #[test]
