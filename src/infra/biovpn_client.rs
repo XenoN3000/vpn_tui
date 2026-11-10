@@ -189,35 +189,76 @@ impl ReqwestBioVpnClient {
 
     /// Internal helper to extract the OpenVPN zip download link from dashboard HTML.
     pub fn find_zip_download_url(&self, html: &str) -> Option<String> {
-        for line in html.lines() {
-            let lower = line.to_lowercase();
-            if lower.contains(".zip") {
-                // Find href="..."
-                if let Some(start_idx) = lower.find("href=\"") {
-                    let rest = &line[start_idx + 6..];
-                    if let Some(end_idx) = rest.find('"') {
-                        let link = rest[..end_idx].trim();
-                        let link_lower = link.to_lowercase();
-                        if link_lower.contains(".zip")
-                            && !link_lower.contains("smart-bio")
-                            && !link_lower.contains("app")
-                            && !link_lower.contains("exe")
-                        {
-                            return if link.starts_with("http://") || link.starts_with("https://") {
-                                Some(link.to_string())
-                            } else {
-                                Some(format!(
-                                    "{}/{}",
-                                    self.base_url,
-                                    link.trim_start_matches('/')
-                                ))
-                            };
+        let mut candidates = Vec::new();
+
+        let bytes = html.as_bytes();
+        let mut i = 0;
+        while i + 5 <= bytes.len() {
+            if bytes[i..i + 5].eq_ignore_ascii_case(b"href=") {
+                let mut start = i + 5;
+                while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
+                    start += 1;
+                }
+                if start < bytes.len() {
+                    let quote = bytes[start];
+                    if quote == b'"' || quote == b'\'' {
+                        start += 1;
+                        let mut end = start;
+                        while end < bytes.len() && bytes[end] != quote {
+                            end += 1;
+                        }
+                        if end < bytes.len() {
+                            if let Ok(link) = std::str::from_utf8(&bytes[start..end]) {
+                                let link = link.trim();
+                                let link_lower = link.to_lowercase();
+                                if link_lower.contains(".zip")
+                                    && !link_lower.contains("smart-bio")
+                                    && !link_lower.contains("app")
+                                    && !link_lower.contains("exe")
+                                    && !link_lower.contains("2client")
+                                    && !link_lower.contains("setup")
+                                    && !link_lower.contains("install")
+                                    && !link_lower.contains(".pbk")
+                                {
+                                    candidates.push(link.to_string());
+                                }
+                            }
+                            i = end + 1;
+                            continue;
                         }
                     }
                 }
             }
+            i += 1;
         }
-        None
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        candidates.sort_by_key(|link| {
+            let lower = link.to_lowercase();
+            if lower.contains("smarttcp") || lower.contains("smart-tcp") {
+                0
+            } else if lower.contains("openvpn") {
+                1
+            } else if lower.contains("tcpx") || lower.contains("tcp") {
+                2
+            } else if lower.contains("config") {
+                3
+            } else {
+                4
+            }
+        });
+
+        let best = &candidates[0];
+        let full_url = if best.starts_with("http://") || best.starts_with("https://") {
+            best.clone()
+        } else {
+            format!("{}/{}", self.base_url, best.trim_start_matches('/'))
+        };
+
+        Some(full_url)
     }
 }
 
@@ -305,6 +346,28 @@ impl BioVpnClient for ReqwestBioVpnClient {
             if !zip_res.status().is_success() {
                 return Err(anyhow!(
                     "Failed to download configuration bundle from {} (HTTP {})",
+                    download_url,
+                    zip_res.status()
+                ));
+            }
+
+            let zip_bytes = zip_res.bytes().await?;
+            Ok(zip_bytes.to_vec())
+        }
+    }
+
+    fn fetch_direct_bundle(
+        &self,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send {
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+
+        async move {
+            let download_url = format!("{}/dl/BioVPN-SmartTCP.zip", base_url);
+            let zip_res = client.get(&download_url).send().await?;
+            if !zip_res.status().is_success() {
+                return Err(anyhow!(
+                    "Failed to download configuration bundle directly from {} (HTTP {})",
                     download_url,
                     zip_res.status()
                 ));
@@ -495,8 +558,59 @@ mod tests {
         let bundle = client.fetch_bundle("testuser", "testpass").await.unwrap();
         assert_eq!(bundle, b"PK\x03\x04mockzipcontent");
 
+        // Test direct bundle fetch
+        let direct_bundle = client.fetch_direct_bundle().await.unwrap();
+        assert_eq!(direct_bundle, b"PK\x03\x04mockzipcontent");
+
         // Test invalid credentials error path
         let err = client.fetch_bundle("testuser", "wrongpass").await;
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_find_zip_download_url_prefers_smarttcp_and_ignores_pbk_and_installers() {
+        let client = ReqwestBioVpnClient::new(Some("https://n1buy.info")).unwrap();
+        let sample_html = r#"
+            <div class="downloads">
+                <a href="https://n1buy.info/dl/app-bio.apk">Download Android App</a>
+                <a href="https://n1buy.info/dl/Smart-Bio-VPN.zip">Windows App</a>
+                <a href="https://n1buy.info/dl/2Client.zip">Cisco / L2TP Phonebook</a>
+                <a href="https://n1buy.info/dl/BioVPN-SmartTCP.zip">OpenVPN SmartTCP Configs</a>
+                <a href="https://n1buy.info/dl/Bio-VPN-Config-TCPX.zip">OpenVPN TCPX Configs</a>
+                <a href="https://n1buy.info/dl/Bio-VPN-Config-2CUDP.zip">OpenVPN UDP Configs</a>
+            </div>
+        "#;
+
+        let result = client.find_zip_download_url(sample_html);
+        assert_eq!(
+            result,
+            Some("https://n1buy.info/dl/BioVPN-SmartTCP.zip".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_zip_download_url_relative_and_fallback_ranking() {
+        let client = ReqwestBioVpnClient::new(Some("https://bio4co.com")).unwrap();
+
+        // When SmartTCP is absent but other OpenVPN config zip is present
+        let html_no_smarttcp = r#"
+            <div>
+                <a href='/dl/2Client.zip'>Legacy</a>
+                <a href='/dl/Bio-VPN-Config-TCPX.zip'>TCPX Config</a>
+            </div>
+        "#;
+        assert_eq!(
+            client.find_zip_download_url(html_no_smarttcp),
+            Some("https://bio4co.com/dl/Bio-VPN-Config-TCPX.zip".to_string())
+        );
+
+        // When only non-openvpn archives are present
+        let html_only_installers = r#"
+            <div>
+                <a href="/dl/2Client.zip">L2TP PBK</a>
+                <a href="/dl/Smart-Bio-VPN.zip">Windows App</a>
+            </div>
+        "#;
+        assert_eq!(client.find_zip_download_url(html_only_installers), None);
     }
 }

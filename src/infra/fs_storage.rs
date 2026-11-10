@@ -1,7 +1,7 @@
 use crate::domain::account::{Account, AccountId};
 use crate::domain::config::{Profile, ProfileId, VpnProtocol};
 use crate::domain::subscription::Subscription;
-use crate::ports::storage::ConfigStorage;
+use crate::ports::storage::{BioVpnPortalsConfig, ConfigStorage};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -85,6 +85,16 @@ impl FsConfigStorage {
         self.root.join("subscriptions.toml")
     }
 
+    pub fn biovpn_portals_file(&self) -> PathBuf {
+        self.root.join("biovpn_portals.toml")
+    }
+
+    pub fn is_managed_path(&self, path: &Path) -> bool {
+        let canonical_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        canonical_path.starts_with(&canonical_root)
+    }
+
     fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("Failed to create config root {:?}", self.root))?;
@@ -155,24 +165,36 @@ impl ConfigStorage for FsConfigStorage {
                 continue;
             }
 
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
+            let entries = match fs::read_dir(&dir) {
+                Ok(rd) => rd.filter_map(|e| e.ok()).collect::<Vec<_>>(),
+                Err(_) => continue,
+            };
+
+            // First pass: load all TOML descriptors
+            for entry in &entries {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "toml") {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(profile) = toml::from_str::<Profile>(&content) {
+                            profiles.push(profile);
+                        }
+                    }
+                }
+            }
+
+            // Second pass: auto-detect standalone .ovpn / .json files not referenced by any TOML
+            for entry in &entries {
                 let path = entry.path();
                 if path.is_file() {
-                    if path.extension().is_some_and(|ext| ext == "toml") {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            let parsed = toml::from_str::<Profile>(&content);
-                            if let Ok(profile) = parsed {
-                                profiles.push(profile);
-                            }
-                        }
-                    } else if proto == VpnProtocol::OpenVpn
-                        && path.extension().is_some_and(|ext| ext == "ovpn")
-                    {
-                        // Check if a companion .toml exists or already loaded this profile
+                    if proto == VpnProtocol::OpenVpn && path.extension().is_some_and(|ext| ext == "ovpn") {
                         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                         let has_companion_toml = path.with_extension("toml").exists();
-                        let already_loaded = profiles.iter().any(|p| p.id.0 == stem);
+                        let already_loaded = profiles.iter().any(|p| {
+                            p.id.0 == stem
+                                || p.ovpn_file.as_ref().is_some_and(|f| {
+                                    f == &path || f.canonicalize().ok() == path.canonicalize().ok()
+                                })
+                        });
                         if !has_companion_toml && !already_loaded {
                             let profile = Profile::new_openvpn(
                                 stem.to_string(),
@@ -181,12 +203,15 @@ impl ConfigStorage for FsConfigStorage {
                             );
                             profiles.push(profile);
                         }
-                    } else if proto == VpnProtocol::V2Ray
-                        && path.extension().is_some_and(|ext| ext == "json")
-                    {
+                    } else if proto == VpnProtocol::V2Ray && path.extension().is_some_and(|ext| ext == "json") {
                         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                         let has_companion_toml = path.with_extension("toml").exists();
-                        let already_loaded = profiles.iter().any(|p| p.id.0 == stem);
+                        let already_loaded = profiles.iter().any(|p| {
+                            p.id.0 == stem
+                                || p.proxy_config_file.as_ref().is_some_and(|f| {
+                                    f == &path || f.canonicalize().ok() == path.canonicalize().ok()
+                                })
+                        });
                         if !has_companion_toml && !already_loaded {
                             let profile = Profile::new_v2ray(
                                 stem.to_string(),
@@ -223,21 +248,74 @@ impl ConfigStorage for FsConfigStorage {
             let dir = self.protocol_dir(proto);
             let toml_file = dir.join(format!("{}.toml", id.0));
             if toml_file.exists() {
-                fs::remove_file(toml_file)?;
+                if let Ok(content) = fs::read_to_string(&toml_file) {
+                    if let Ok(profile) = toml::from_str::<Profile>(&content) {
+                        if let Some(ref ovpn_path) = profile.ovpn_file {
+                            if self.is_managed_path(ovpn_path) && ovpn_path.exists() {
+                                let _ = fs::remove_file(ovpn_path);
+                            }
+                        }
+                        if let Some(ref v2_path) = profile.proxy_config_file {
+                            if self.is_managed_path(v2_path) && v2_path.exists() {
+                                let _ = fs::remove_file(v2_path);
+                            }
+                        }
+                    }
+                }
+                fs::remove_file(&toml_file)?;
                 removed = true;
             }
             if proto == VpnProtocol::OpenVpn {
                 let ovpn_file = dir.join(format!("{}.ovpn", id.0));
                 if ovpn_file.exists() {
-                    fs::remove_file(ovpn_file)?;
+                    let _ = fs::remove_file(ovpn_file);
                     removed = true;
                 }
             }
             if proto == VpnProtocol::V2Ray {
                 let json_file = dir.join(format!("{}.json", id.0));
                 if json_file.exists() {
-                    fs::remove_file(json_file)?;
+                    let _ = fs::remove_file(json_file);
                     removed = true;
+                }
+            }
+
+            if dir.exists() {
+                if let Ok(entries) = fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if proto == VpnProtocol::OpenVpn
+                                && path.extension().is_some_and(|ext| ext == "ovpn")
+                            {
+                                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                                let slug = stem
+                                    .to_lowercase()
+                                    .replace(' ', "-")
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric() || *c == '-')
+                                    .collect::<String>();
+                                if stem == id.0 || slug == id.0 || stem.eq_ignore_ascii_case(&id.0) {
+                                    let _ = fs::remove_file(&path);
+                                    removed = true;
+                                }
+                            } else if proto == VpnProtocol::V2Ray
+                                && path.extension().is_some_and(|ext| ext == "json")
+                            {
+                                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                                let slug = stem
+                                    .to_lowercase()
+                                    .replace(' ', "-")
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric() || *c == '-')
+                                    .collect::<String>();
+                                if stem == id.0 || slug == id.0 || stem.eq_ignore_ascii_case(&id.0) {
+                                    let _ = fs::remove_file(&path);
+                                    removed = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -315,6 +393,26 @@ impl ConfigStorage for FsConfigStorage {
         };
         let serialized = toml::to_string_pretty(&manifest)?;
         fs::write(self.subscriptions_file(), serialized)?;
+        Ok(())
+    }
+
+    fn load_biovpn_portals(&self) -> Result<BioVpnPortalsConfig> {
+        let file = self.biovpn_portals_file();
+        if !file.exists() {
+            return Ok(BioVpnPortalsConfig::default());
+        }
+
+        let content = fs::read_to_string(&file)
+            .with_context(|| format!("Failed to read BioVPN portals file {:?}", file))?;
+        let config: BioVpnPortalsConfig = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse BioVPN portals file {:?}", file))?;
+        Ok(config)
+    }
+
+    fn save_biovpn_portals(&mut self, config: &BioVpnPortalsConfig) -> Result<()> {
+        self.ensure_dirs()?;
+        let serialized = toml::to_string_pretty(config)?;
+        fs::write(self.biovpn_portals_file(), serialized)?;
         Ok(())
     }
 }
@@ -473,5 +571,155 @@ mod tests {
         let updated = storage.load_subscriptions().unwrap();
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].name, "Sub Alpha");
+    }
+
+    #[test]
+    fn test_fs_storage_biovpn_portals_lifecycle() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        // Default when file does not exist
+        let default_config = storage.load_biovpn_portals().unwrap();
+        assert_eq!(default_config, BioVpnPortalsConfig::default());
+        assert_eq!(
+            default_config.urls,
+            vec![
+                "https://bio4co.com".to_string(),
+                "https://n1buy.info".to_string(),
+            ]
+        );
+
+        let custom = BioVpnPortalsConfig {
+            selected: Some("https://n1buy.info".to_string()),
+            urls: vec![
+                "https://bio4co.com".to_string(),
+                "https://n1buy.info".to_string(),
+                "https://mirror3.net".to_string(),
+            ],
+        };
+        storage.save_biovpn_portals(&custom).unwrap();
+        assert!(storage.biovpn_portals_file().exists());
+
+        let loaded = storage.load_biovpn_portals().unwrap();
+        assert_eq!(loaded, custom);
+    }
+
+    #[test]
+    fn test_fs_storage_delete_openvpn_profile_cleans_managed_file() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        let fake_ovpn = tmp.path().join("source.ovpn");
+        fs::write(&fake_ovpn, "client\ndev tun\nremote 1.2.3.4 1194").unwrap();
+
+        let imported = storage.import_ovpn(&fake_ovpn, "Test OpenVPN").unwrap();
+        let ovpn_file = imported.ovpn_file.as_ref().unwrap().clone();
+        assert!(ovpn_file.exists());
+
+        let loaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        // Delete profile
+        let deleted = storage.delete_profile(&imported.id).unwrap();
+        assert!(deleted);
+
+        // Check both toml and ovpn are deleted
+        assert!(!ovpn_file.exists());
+        let reloaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(reloaded.len(), 0);
+    }
+
+    #[test]
+    fn test_fs_storage_delete_biovpn_synced_profile_with_different_slug() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+        storage.ensure_dirs().unwrap();
+
+        // BioVPN creates a file named "de-frankfurt.ovpn"
+        let ovpn_dir = storage.protocol_dir(VpnProtocol::OpenVpn);
+        let ovpn_file = ovpn_dir.join("de-frankfurt.ovpn");
+        fs::write(&ovpn_file, "client\ndev tun\nremote 1.2.3.4 1194").unwrap();
+
+        // But the profile is named "de-frankfurt (OVPN)" with slug "de-frankfurt-ovpn"
+        let profile = Profile::new_openvpn(
+            "de-frankfurt (OVPN)",
+            "1.2.3.4:1194",
+            Some(ovpn_file.clone()),
+        )
+        .with_group("BioVPN/OpenVPN");
+        assert_eq!(profile.id.0, "de-frankfurt-ovpn");
+
+        storage.save_profile(&profile).unwrap();
+
+        let loaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "de-frankfurt (OVPN)");
+
+        // Deleting the profile by ID must delete "de-frankfurt.ovpn"
+        let deleted = storage.delete_profile(&profile.id).unwrap();
+        assert!(deleted);
+        assert!(!ovpn_file.exists(), "Underlying .ovpn file must be removed");
+
+        // Reload must NOT resurrect the profile
+        let reloaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(reloaded.len(), 0, "Deleted profile must not be resurrected");
+    }
+
+    #[test]
+    fn test_fs_storage_delete_profile_preserves_external_file() {
+        let tmp_storage = tempdir().unwrap();
+        let tmp_external = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp_storage.path());
+
+        // File located outside config root
+        let external_ovpn = tmp_external.path().join("external_config.ovpn");
+        fs::write(&external_ovpn, "client\ndev tun\nremote 1.2.3.4 1194").unwrap();
+
+        let profile = Profile::new_openvpn(
+            "External Profile",
+            "1.2.3.4:1194",
+            Some(external_ovpn.clone()),
+        );
+        storage.save_profile(&profile).unwrap();
+
+        let loaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        // Delete profile
+        let deleted = storage.delete_profile(&profile.id).unwrap();
+        assert!(deleted);
+
+        // External file MUST still exist!
+        assert!(external_ovpn.exists(), "External file outside managed root must be preserved");
+
+        let reloaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(reloaded.len(), 0);
+    }
+
+    #[test]
+    fn test_fs_storage_delete_auto_detected_openvpn_profile() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+        storage.ensure_dirs().unwrap();
+
+        // Drop a standalone .ovpn file without any companion .toml
+        let ovpn_dir = storage.protocol_dir(VpnProtocol::OpenVpn);
+        let standalone_file = ovpn_dir.join("My_Company_Server.ovpn");
+        fs::write(&standalone_file, "client\ndev tun\nremote 1.2.3.4 1194").unwrap();
+
+        // Load profiles: auto-detects it
+        let loaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let detected = &loaded[0];
+        assert_eq!(detected.id.0, "mycompanyserver");
+
+        // Delete auto-detected profile
+        let deleted = storage.delete_profile(&detected.id).unwrap();
+        assert!(deleted);
+        assert!(!standalone_file.exists(), "Standalone .ovpn file must be deleted");
+
+        // Reload must find 0 profiles
+        let reloaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
+        assert_eq!(reloaded.len(), 0);
     }
 }

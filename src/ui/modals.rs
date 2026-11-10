@@ -58,6 +58,9 @@ pub fn render_modal(
         ActiveModal::SyncManager(sync_state) => {
             render_sync_manager_modal(f, sync_state, accounts, theme);
         }
+        ActiveModal::AddBioVpnPortal { input, error, .. } => {
+            render_add_biovpn_portal_modal(f, input, error.as_deref(), theme);
+        }
         ActiveModal::SyncFileBrowser { state, .. } => {
             render_file_browser_modal(f, state, theme);
         }
@@ -795,7 +798,7 @@ pub fn render_sync_manager_modal(
     accounts: &[crate::domain::account::Account],
     theme: &Theme,
 ) {
-    let area = centered_rect(65, 55, f.area());
+    let area = centered_rect(70, 75, f.area());
     f.render_widget(Clear, area);
 
     let methods = [
@@ -846,10 +849,20 @@ pub fn render_sync_manager_modal(
             Span::styled("Press [Enter] to open Subscription Manager", theme.text),
         ]));
     } else {
-        let target_acc_name = accounts
-            .get(sync_state.target_account_idx)
+        if sync_state.selected_method_idx == 0 {
+            let portal_display = sync_state.selected_portal_url();
+            lines.push(Line::from(vec![
+                Span::styled("Portal URL:     ", theme.footer_key),
+                Span::styled(format!("< {} >", portal_display), theme.highlight),
+                Span::styled("  ([◄/►] Switch  [a] Add  [d] Delete)", theme.footer_desc),
+            ]));
+        }
+
+        let target_acc_name = sync_state
+            .target_account_idx
+            .and_then(|idx| accounts.get(idx))
             .map(|a| a.name.as_str())
-            .unwrap_or("No Account Linked");
+            .unwrap_or("(None)");
         lines.push(Line::from(vec![
             Span::styled("Target Account: ", theme.footer_key),
             Span::styled(
@@ -878,6 +891,16 @@ pub fn render_sync_manager_modal(
     }
 
     lines.push(Line::raw(""));
+    if sync_state.selected_method_idx == 0 {
+        lines.push(Line::from(vec![
+            Span::styled("[◄/►]", theme.footer_key),
+            Span::raw(" Switch Portal   "),
+            Span::styled("[a]", theme.footer_key),
+            Span::raw(" Add Portal   "),
+            Span::styled("[d]", theme.footer_key),
+            Span::raw(" Delete Portal"),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::styled("[↑/↓]", theme.footer_key),
         Span::raw(" Select Method   "),
@@ -910,10 +933,11 @@ pub fn render_batch_input_modal(
     let area = centered_rect(65, 55, f.area());
     f.render_widget(Clear, area);
 
-    let target_acc_name = accounts
-        .get(batch_state.target_account_idx)
+    let target_acc_name = batch_state
+        .target_account_idx
+        .and_then(|idx| accounts.get(idx))
         .map(|a| a.name.as_str())
-        .unwrap_or("No Account Linked");
+        .unwrap_or("(None)");
 
     let mut lines = Vec::new();
     lines.push(Line::styled(
@@ -1157,6 +1181,59 @@ pub fn render_subscription_manager_modal(
         let paragraph = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true });
         f.render_widget(paragraph, inner);
     }
+}
+
+pub fn render_add_biovpn_portal_modal(
+    f: &mut Frame,
+    input: &str,
+    error: Option<&str>,
+    theme: &Theme,
+) {
+    let area = centered_rect(65, 30, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_active)
+        .title(" Add BioVPN Portal Mirror ");
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::styled(
+        "Enter portal domain or base URL (e.g. n1buy.info or https://...):",
+        theme.footer_desc,
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("▶ ", theme.footer_key),
+        Span::styled(format!("{}_", input), theme.highlight),
+    ]));
+
+    if let Some(err) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(err, theme.failed));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Note: Automatically prefixes https:// if scheme is omitted.",
+        theme.footer_desc,
+    ));
+    lines.push(Line::raw(
+        "────────────────────────────────────────────────────────────────",
+    ));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", theme.footer_key),
+        Span::raw(" Save & Select   "),
+        Span::styled("[Esc]", theme.footer_key),
+        Span::raw(" Cancel"),
+    ]));
+
+    let p = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(p, inner);
 }
 
 #[cfg(test)]
@@ -1565,7 +1642,7 @@ pub mod sync_manager {
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::default();
         let accounts = vec![Account::new("BioAccount")];
-        let sync_state = SyncManagerState::new();
+        let mut sync_state = SyncManagerState::new();
 
         terminal
             .draw(|f| {
@@ -1578,7 +1655,17 @@ pub mod sync_manager {
         assert!(buffer.contains("BioVPN Online Sync"));
         assert!(buffer.contains("Import OpenVPN Archive (.zip)"));
         assert!(buffer.contains("Batch Paste Server IPs"));
-        assert!(buffer.contains("BioAccount"));
+        assert!(buffer.contains("(None)"));
+
+        // With account selected
+        sync_state.target_account_idx = Some(0);
+        terminal
+            .draw(|f| {
+                render_sync_manager_modal(f, &sync_state, &accounts, &theme);
+            })
+            .unwrap();
+        let buffer_acc = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer_acc.contains("BioAccount"));
     }
 
     #[test]
@@ -1589,7 +1676,7 @@ pub mod sync_manager {
         let accounts = vec![Account::new("BioAccount")];
         let batch_state = BatchInputState {
             text: "Germany 185.120.45.10\nNetherlands 45.93.169.132".into(),
-            target_account_idx: 0,
+            target_account_idx: Some(0),
             error_message: None,
         };
 
@@ -1650,5 +1737,45 @@ pub mod sync_manager {
         assert!(buffer.contains("New Configuration Folder"));
         assert!(buffer.contains("Personal/Asia"));
         assert!(buffer.contains("nested subfolders"));
+    }
+
+    #[test]
+    fn test_render_add_biovpn_portal_modal() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+
+        terminal
+            .draw(|f| {
+                render_add_biovpn_portal_modal(f, "n1buy.info", Some("Invalid URL"), &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("Add BioVPN Portal Mirror"));
+        assert!(buffer.contains("n1buy.info"));
+        assert!(buffer.contains("Invalid URL"));
+        assert!(buffer.contains("Automatically prefixes https://"));
+    }
+
+    #[test]
+    fn test_render_sync_manager_modal_with_portals() {
+        let backend = TestBackend::new(100, 45);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let state = crate::app::SyncManagerState::default();
+
+        terminal
+            .draw(|f| {
+                render_sync_manager_modal(f, &state, &[], &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("Portal URL:"));
+        assert!(buffer.contains("https://bio4co.com"));
+        assert!(buffer.contains("Switch Portal"));
+        assert!(buffer.contains("Add Portal"));
+        assert!(buffer.contains("Delete Portal"));
     }
 }

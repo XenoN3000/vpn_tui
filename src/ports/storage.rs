@@ -5,6 +5,89 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BioVpnPortalsConfig {
+    #[serde(default)]
+    pub selected: Option<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+}
+
+impl Default for BioVpnPortalsConfig {
+    fn default() -> Self {
+        Self {
+            selected: Some("https://bio4co.com".to_string()),
+            urls: vec![
+                "https://bio4co.com".to_string(),
+                "https://n1buy.info".to_string(),
+            ],
+        }
+    }
+}
+
+impl BioVpnPortalsConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Normalizes a portal URL by trimming whitespace and trailing slashes,
+    /// and auto-prefixing with https:// if no scheme is provided.
+    pub fn normalize_url(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let no_trailing = trimmed.trim_end_matches('/');
+        if no_trailing.is_empty() {
+            return None;
+        }
+        if no_trailing.starts_with("http://") || no_trailing.starts_with("https://") {
+            Some(no_trailing.to_string())
+        } else {
+            Some(format!("https://{}", no_trailing))
+        }
+    }
+
+    /// Adds a new URL after normalization if not already present.
+    /// Sets the added or existing URL as selected.
+    /// Returns true if added, false if invalid.
+    pub fn add_url(&mut self, raw: &str) -> bool {
+        let Some(norm) = Self::normalize_url(raw) else {
+            return false;
+        };
+        if !self.urls.contains(&norm) {
+            self.urls.push(norm.clone());
+        }
+        self.selected = Some(norm);
+        true
+    }
+
+    /// Deletes a URL. If the resulting list is empty, restores default seeds.
+    pub fn delete_url(&mut self, url: &str) -> bool {
+        let initial_len = self.urls.len();
+        self.urls.retain(|u| u != url);
+        if self.urls.len() == initial_len {
+            return false;
+        }
+        if self.urls.is_empty() {
+            let def = Self::default();
+            self.urls = def.urls;
+            self.selected = def.selected;
+        } else if self.selected.as_deref() == Some(url) {
+            self.selected = self.urls.first().cloned();
+        }
+        true
+    }
+
+    /// Returns the currently active URL, or falls back to the first URL or default.
+    pub fn active_url(&self) -> String {
+        self.selected
+            .clone()
+            .or_else(|| self.urls.first().cloned())
+            .unwrap_or_else(|| "https://bio4co.com".to_string())
+    }
+}
+
 pub trait ConfigStorage: Send + Sync {
     fn load_accounts(&self) -> Result<Vec<Account>>;
     fn save_account(&mut self, account: &Account) -> Result<()>;
@@ -22,6 +105,9 @@ pub trait ConfigStorage: Send + Sync {
 
     fn load_subscriptions(&self) -> Result<Vec<Subscription>>;
     fn save_subscriptions(&mut self, subscriptions: &[Subscription]) -> Result<()>;
+
+    fn load_biovpn_portals(&self) -> Result<BioVpnPortalsConfig>;
+    fn save_biovpn_portals(&mut self, config: &BioVpnPortalsConfig) -> Result<()>;
 }
 
 /// In-memory mock storage for unit testing.
@@ -32,6 +118,7 @@ pub struct InMemoryStorage {
     pub profiles: HashMap<ProfileId, Profile>,
     pub folders: Vec<String>,
     pub subscriptions: Vec<Subscription>,
+    pub biovpn_portals: Option<BioVpnPortalsConfig>,
 }
 
 impl InMemoryStorage {
@@ -42,6 +129,7 @@ impl InMemoryStorage {
             profiles: HashMap::new(),
             folders: Vec::new(),
             subscriptions: Vec::new(),
+            biovpn_portals: None,
         }
     }
 }
@@ -110,6 +198,15 @@ impl ConfigStorage for InMemoryStorage {
 
     fn save_subscriptions(&mut self, subscriptions: &[Subscription]) -> Result<()> {
         self.subscriptions = subscriptions.to_vec();
+        Ok(())
+    }
+
+    fn load_biovpn_portals(&self) -> Result<BioVpnPortalsConfig> {
+        Ok(self.biovpn_portals.clone().unwrap_or_default())
+    }
+
+    fn save_biovpn_portals(&mut self, config: &BioVpnPortalsConfig) -> Result<()> {
+        self.biovpn_portals = Some(config.clone());
         Ok(())
     }
 }
@@ -200,5 +297,50 @@ mod tests {
 
         let loaded = storage.load_folders().unwrap();
         assert_eq!(loaded, folders);
+    }
+
+    #[test]
+    fn test_in_memory_storage_biovpn_portals() {
+        let mut storage = InMemoryStorage::new();
+        let default_config = storage.load_biovpn_portals().unwrap();
+        assert_eq!(default_config, BioVpnPortalsConfig::default());
+
+        let custom = BioVpnPortalsConfig {
+            selected: Some("https://n1buy.info".to_string()),
+            urls: vec!["https://n1buy.info".to_string()],
+        };
+        storage.save_biovpn_portals(&custom).unwrap();
+        assert_eq!(storage.load_biovpn_portals().unwrap(), custom);
+    }
+
+    #[test]
+    fn test_biovpn_portals_config_helpers() {
+        assert_eq!(BioVpnPortalsConfig::normalize_url("   "), None);
+        assert_eq!(BioVpnPortalsConfig::normalize_url("///"), None);
+        assert_eq!(
+            BioVpnPortalsConfig::normalize_url("n1buy.info"),
+            Some("https://n1buy.info".to_string())
+        );
+        assert_eq!(
+            BioVpnPortalsConfig::normalize_url("http://mirror.org/path/"),
+            Some("http://mirror.org/path".to_string())
+        );
+
+        let mut config = BioVpnPortalsConfig::default();
+        assert_eq!(config.active_url(), "https://bio4co.com");
+
+        // Add URL
+        assert!(config.add_url("  newportal.io/ "));
+        assert_eq!(config.active_url(), "https://newportal.io");
+        assert!(config.urls.contains(&"https://newportal.io".to_string()));
+
+        // Delete URL
+        assert!(config.delete_url("https://newportal.io"));
+        assert_ne!(config.active_url(), "https://newportal.io");
+
+        // Delete all -> resets to default
+        config.delete_url("https://bio4co.com");
+        config.delete_url("https://n1buy.info");
+        assert_eq!(config, BioVpnPortalsConfig::default());
     }
 }

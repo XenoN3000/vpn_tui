@@ -8,4 +8,9 @@ pub trait BioVpnClient: Send + Sync {
         username: &str,
         password: &str,
     ) -> impl Future<Output = Result<Vec<u8>>> + Send;
+
+    /// Fetches the raw bytes of the public configuration ZIP bundle directly without credentials.
+    fn fetch_direct_bundle(
+        &self,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send;
 }

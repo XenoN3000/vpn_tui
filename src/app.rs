@@ -8,7 +8,7 @@ use crate::domain::subscription::{
 };
 use crate::infra::net_monitor::NetStats;
 use crate::ports::pinger::Pinger;
-use crate::ports::storage::ConfigStorage;
+use crate::ports::storage::{BioVpnPortalsConfig, ConfigStorage};
 use crate::ports::vpn_runner::{CertProbeResult, LogEvent, VpnRunner};
 use anyhow::Result;
 use ratatui::widgets::ListState;
@@ -416,27 +416,89 @@ pub enum DeleteTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncManagerState {
     pub selected_method_idx: usize,
-    pub target_account_idx: usize,
+    pub target_account_idx: Option<usize>,
     pub with_cisco: bool,
+    pub portal_urls: Vec<String>,
+    pub selected_portal_idx: usize,
     pub status_message: Option<String>,
     pub error_message: Option<String>,
 }
 
 impl Default for SyncManagerState {
     fn default() -> Self {
-        Self {
-            selected_method_idx: 0,
-            target_account_idx: 0,
-            with_cisco: true,
-            status_message: None,
-            error_message: None,
-        }
+        Self::with_portals(&BioVpnPortalsConfig::default())
     }
 }
 
 impl SyncManagerState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_portals(config: &BioVpnPortalsConfig) -> Self {
+        let urls = if config.urls.is_empty() {
+            BioVpnPortalsConfig::default().urls
+        } else {
+            config.urls.clone()
+        };
+        let selected_idx = config
+            .selected
+            .as_ref()
+            .and_then(|sel| urls.iter().position(|u| u == sel))
+            .unwrap_or(0);
+
+        Self {
+            selected_method_idx: 0,
+            target_account_idx: None,
+            with_cisco: true,
+            portal_urls: urls,
+            selected_portal_idx: selected_idx,
+            status_message: None,
+            error_message: None,
+        }
+    }
+
+    pub fn selected_portal_url(&self) -> String {
+        self.portal_urls
+            .get(self.selected_portal_idx)
+            .cloned()
+            .unwrap_or_else(|| "https://bio4co.com".to_string())
+    }
+
+    pub fn cycle_portal_next(&mut self) {
+        if !self.portal_urls.is_empty() {
+            self.selected_portal_idx = (self.selected_portal_idx + 1) % self.portal_urls.len();
+        }
+    }
+
+    pub fn cycle_portal_prev(&mut self) {
+        if !self.portal_urls.is_empty() {
+            if self.selected_portal_idx == 0 {
+                self.selected_portal_idx = self.portal_urls.len() - 1;
+            } else {
+                self.selected_portal_idx -= 1;
+            }
+        }
+    }
+
+    pub fn delete_current_portal(&mut self) {
+        if !self.portal_urls.is_empty() {
+            self.portal_urls.remove(self.selected_portal_idx);
+            if self.portal_urls.is_empty() {
+                let def = BioVpnPortalsConfig::default();
+                self.portal_urls = def.urls;
+                self.selected_portal_idx = 0;
+            } else if self.selected_portal_idx >= self.portal_urls.len() {
+                self.selected_portal_idx = self.portal_urls.len() - 1;
+            }
+        }
+    }
+
+    pub fn to_portals_config(&self) -> BioVpnPortalsConfig {
+        BioVpnPortalsConfig {
+            selected: Some(self.selected_portal_url()),
+            urls: self.portal_urls.clone(),
+        }
     }
 }
 
@@ -485,7 +547,7 @@ impl SubscriptionManagerState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchInputState {
     pub text: String,
-    pub target_account_idx: usize,
+    pub target_account_idx: Option<usize>,
     pub error_message: Option<String>,
 }
 
@@ -524,6 +586,11 @@ pub enum ActiveModal {
     },
     CertWarning(CertWarningState),
     SyncManager(SyncManagerState),
+    AddBioVpnPortal {
+        input: String,
+        error: Option<String>,
+        sync_state: SyncManagerState,
+    },
     BatchInput(BatchInputState),
     SubscriptionManager(SubscriptionManagerState),
 }
@@ -540,6 +607,7 @@ pub struct App<S: ConfigStorage, R: VpnRunner, P: Pinger> {
     pub selected_profile_idx: usize,
 
     pub subscriptions: Vec<Subscription>,
+    pub biovpn_portals: BioVpnPortalsConfig,
 
     pub active_pane: ActivePane,
     pub active_modal: ActiveModal,
@@ -572,6 +640,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         let profiles = storage.load_profiles(None).unwrap_or_default();
         let custom_folders = storage.load_folders().unwrap_or_default();
         let subscriptions = storage.load_subscriptions().unwrap_or_default();
+        let biovpn_portals = storage.load_biovpn_portals().unwrap_or_default();
 
         let mut expanded_folders = std::collections::HashSet::new();
         for p in &profiles {
@@ -612,6 +681,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
             profiles,
             selected_profile_idx: 0,
             subscriptions,
+            biovpn_portals,
             active_pane: ActivePane::Profiles,
             active_modal: ActiveModal::None,
             connection_state: ConnectionState::Disconnected,
@@ -1909,6 +1979,35 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 KeyCode::Esc => {
                     self.active_modal = ActiveModal::None;
                 }
+                KeyCode::Left | KeyCode::Char('h') if state.selected_method_idx == 0 => {
+                    state.cycle_portal_prev();
+                    self.biovpn_portals = state.to_portals_config();
+                    let _ = self.storage.save_biovpn_portals(&self.biovpn_portals);
+                    self.active_modal = ActiveModal::SyncManager(state);
+                }
+                KeyCode::Right | KeyCode::Char('l') if state.selected_method_idx == 0 => {
+                    state.cycle_portal_next();
+                    self.biovpn_portals = state.to_portals_config();
+                    let _ = self.storage.save_biovpn_portals(&self.biovpn_portals);
+                    self.active_modal = ActiveModal::SyncManager(state);
+                }
+                KeyCode::Char('a') if state.selected_method_idx == 0 => {
+                    self.active_modal = ActiveModal::AddBioVpnPortal {
+                        input: String::new(),
+                        error: None,
+                        sync_state: state,
+                    };
+                }
+                KeyCode::Char('d') if state.selected_method_idx == 0 => {
+                    state.delete_current_portal();
+                    self.biovpn_portals = state.to_portals_config();
+                    let _ = self.storage.save_biovpn_portals(&self.biovpn_portals);
+                    state.status_message = Some(format!(
+                        "Portal mirror updated (active: {})",
+                        state.selected_portal_url()
+                    ));
+                    self.active_modal = ActiveModal::SyncManager(state);
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.selected_method_idx = state.selected_method_idx.saturating_sub(1);
                     self.active_modal = ActiveModal::SyncManager(state);
@@ -1920,10 +2019,13 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::SyncManager(state);
                 }
                 KeyCode::Tab => {
-                    if !self.accounts.is_empty() {
-                        state.target_account_idx =
-                            (state.target_account_idx + 1) % self.accounts.len();
-                    }
+                    state.target_account_idx =
+                        next_account_idx(state.target_account_idx, self.accounts.len());
+                    self.active_modal = ActiveModal::SyncManager(state);
+                }
+                KeyCode::BackTab => {
+                    state.target_account_idx =
+                        prev_account_idx(state.target_account_idx, self.accounts.len());
                     self.active_modal = ActiveModal::SyncManager(state);
                 }
                 KeyCode::Char(' ') => {
@@ -1932,33 +2034,35 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 }
                 KeyCode::Enter => match state.selected_method_idx {
                     0 => {
-                        let account = self.accounts.get(state.target_account_idx);
-                        let (username, password) = match account {
-                            Some(acc) => {
-                                let creds = acc.credentials.as_ref();
-                                let u = creds.and_then(|c| c.username.clone()).unwrap_or_default();
-                                let p = creds.and_then(|c| c.password.clone()).unwrap_or_default();
-                                if u.trim().is_empty() || p.trim().is_empty() {
-                                    state.error_message = Some(format!(
-                                        "Account '{}' has empty username or password.",
-                                        acc.id.0
-                                    ));
+                        let (target_acc_id, creds) = match state.target_account_idx {
+                            Some(idx) => match self.accounts.get(idx) {
+                                Some(acc) => {
+                                    let creds = acc.credentials.as_ref();
+                                    let u = creds.and_then(|c| c.username.clone()).unwrap_or_default();
+                                    let p = creds.and_then(|c| c.password.clone()).unwrap_or_default();
+                                    if u.trim().is_empty() || p.trim().is_empty() {
+                                        state.error_message = Some(format!(
+                                            "Account '{}' has empty username or password.",
+                                            acc.id.0
+                                        ));
+                                        self.active_modal = ActiveModal::SyncManager(state);
+                                        return Ok(());
+                                    }
+                                    (Some(acc.id.clone()), Some((u, p)))
+                                }
+                                None => {
+                                    state.error_message =
+                                        Some("No account selected for sync.".to_string());
                                     self.active_modal = ActiveModal::SyncManager(state);
                                     return Ok(());
                                 }
-                                (u, p)
-                            }
-                            None => {
-                                state.error_message =
-                                    Some("No account selected for sync.".to_string());
-                                self.active_modal = ActiveModal::SyncManager(state);
-                                return Ok(());
-                            }
+                            },
+                            None => (None, None),
                         };
-                        let target_acc_id = account.map(|a| a.id.clone());
 
+                        let portal_url = state.selected_portal_url();
                         let client =
-                            match crate::infra::biovpn_client::ReqwestBioVpnClient::new(None) {
+                            match crate::infra::biovpn_client::ReqwestBioVpnClient::new(Some(&portal_url)) {
                                 Ok(c) => c,
                                 Err(e) => {
                                     state.error_message = Some(format!("HTTP client error: {}", e));
@@ -1968,7 +2072,16 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             };
 
                         use crate::ports::biovpn::BioVpnClient;
-                        match client.fetch_bundle(&username, &password).await {
+                        let bundle_res = match creds {
+                            Some((username, password)) => {
+                                client.fetch_bundle(&username, &password).await
+                            }
+                            None => {
+                                client.fetch_direct_bundle().await
+                            }
+                        };
+
+                        match bundle_res {
                             Ok(zip_bytes) => {
                                 let dest = {
                                     let root = self.storage.get_config_root();
@@ -2071,9 +2184,9 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             .map(|s| s.eq_ignore_ascii_case("zip"))
                             .unwrap_or(false);
                         if is_zip {
-                            let target_acc = self
-                                .accounts
-                                .get(sync_state.target_account_idx)
+                            let target_acc = sync_state
+                                .target_account_idx
+                                .and_then(|idx| self.accounts.get(idx))
                                 .map(|a| a.id.clone());
                             let dest = {
                                 let root = self.storage.get_config_root();
@@ -2138,6 +2251,64 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::SyncFileBrowser { state, sync_state };
                 }
             },
+            ActiveModal::AddBioVpnPortal {
+                mut input,
+                error,
+                mut sync_state,
+            } => match code {
+                KeyCode::Esc => {
+                    self.active_modal = ActiveModal::SyncManager(sync_state);
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.active_modal = ActiveModal::AddBioVpnPortal {
+                        input,
+                        error: None,
+                        sync_state,
+                    };
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.active_modal = ActiveModal::AddBioVpnPortal {
+                        input,
+                        error: None,
+                        sync_state,
+                    };
+                }
+                KeyCode::Enter => {
+                    if let Some(norm) = BioVpnPortalsConfig::normalize_url(&input) {
+                        if !sync_state.portal_urls.contains(&norm) {
+                            sync_state.portal_urls.push(norm.clone());
+                        }
+                        sync_state.selected_portal_idx = sync_state
+                            .portal_urls
+                            .iter()
+                            .position(|u| u == &norm)
+                            .unwrap_or(0);
+                        self.biovpn_portals = sync_state.to_portals_config();
+                        let _ = self.storage.save_biovpn_portals(&self.biovpn_portals);
+                        sync_state.status_message =
+                            Some(format!("Added portal mirror: {}", norm));
+                        sync_state.error_message = None;
+                        self.active_modal = ActiveModal::SyncManager(sync_state);
+                    } else {
+                        self.active_modal = ActiveModal::AddBioVpnPortal {
+                            input,
+                            error: Some(
+                                "Please enter a valid URL or domain (e.g. n1buy.info)".to_string(),
+                            ),
+                            sync_state,
+                        };
+                    }
+                }
+                _ => {
+                    self.active_modal = ActiveModal::AddBioVpnPortal {
+                        input,
+                        error,
+                        sync_state,
+                    };
+                }
+            },
             ActiveModal::BatchInput(mut state) => match code {
                 KeyCode::Esc => {
                     self.active_modal = ActiveModal::SyncManager(SyncManagerState {
@@ -2154,9 +2325,9 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::BatchInput(state);
                 }
                 KeyCode::Enter => {
-                    let target_acc = self
-                        .accounts
-                        .get(state.target_account_idx)
+                    let target_acc = state
+                        .target_account_idx
+                        .and_then(|idx| self.accounts.get(idx))
                         .map(|a| a.id.clone());
                     match crate::domain::importer::ProfileImporter::parse_server_list(
                         &state.text,
@@ -2718,7 +2889,12 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::Account(AccountModalState::new());
                 }
                 KeyCode::Char('S') | KeyCode::Char('s') => {
-                    self.active_modal = ActiveModal::SyncManager(SyncManagerState::new());
+                    let mut sync_state = SyncManagerState::with_portals(&self.biovpn_portals);
+                    if !self.accounts.is_empty() {
+                        sync_state.target_account_idx =
+                            Some(self.selected_account_idx.min(self.accounts.len() - 1));
+                    }
+                    self.active_modal = ActiveModal::SyncManager(sync_state);
                 }
                 KeyCode::Char('e') => {
                     match self.active_pane {
@@ -4339,7 +4515,10 @@ mod tests {
         let storage = InMemoryStorage::new();
         let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
 
-        app.active_modal = ActiveModal::SyncManager(SyncManagerState::new());
+        app.active_modal = ActiveModal::SyncManager(SyncManagerState {
+            target_account_idx: Some(0),
+            ..Default::default()
+        });
         app.handle_key(KeyCode::Enter).await.unwrap();
 
         if let ActiveModal::SyncManager(state) = &app.active_modal {
@@ -4362,7 +4541,10 @@ mod tests {
         storage.save_account(&acc).unwrap();
         let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
 
-        app.active_modal = ActiveModal::SyncManager(SyncManagerState::new());
+        app.active_modal = ActiveModal::SyncManager(SyncManagerState {
+            target_account_idx: Some(0),
+            ..Default::default()
+        });
         app.handle_key(KeyCode::Enter).await.unwrap();
 
         if let ActiveModal::SyncManager(state) = &app.active_modal {
@@ -4550,6 +4732,332 @@ mod tests {
         } else {
             panic!("Expected ConfigAdder modal");
         }
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_portal_cycling_and_deletion() {
+        let storage = InMemoryStorage::new();
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        // Press 'S' to open SyncManager
+        app.handle_key(KeyCode::Char('S')).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.selected_method_idx, 0);
+            assert_eq!(st.selected_portal_url(), "https://bio4co.com");
+            assert_eq!(st.portal_urls.len(), 2);
+        } else {
+            panic!("Expected SyncManager modal");
+        }
+
+        // Cycle right -> selects https://n1buy.info
+        app.handle_key(KeyCode::Right).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.selected_portal_url(), "https://n1buy.info");
+        } else {
+            panic!("Expected SyncManager modal");
+        }
+
+        // Cycle left -> returns to https://bio4co.com
+        app.handle_key(KeyCode::Left).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.selected_portal_url(), "https://bio4co.com");
+        } else {
+            panic!("Expected SyncManager modal");
+        }
+
+        // Delete current portal (bio4co.com)
+        app.handle_key(KeyCode::Char('d')).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.portal_urls.len(), 1);
+            assert_eq!(st.selected_portal_url(), "https://n1buy.info");
+        } else {
+            panic!("Expected SyncManager modal");
+        }
+
+        // Delete only remaining portal (n1buy.info) -> resets to default 2 mirrors!
+        app.handle_key(KeyCode::Char('d')).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.portal_urls.len(), 2);
+            assert_eq!(st.portal_urls[0], "https://bio4co.com");
+            assert_eq!(st.portal_urls[1], "https://n1buy.info");
+        } else {
+            panic!("Expected SyncManager modal");
+        }
+
+        // Verify storage persisted the default portals
+        let loaded = app.storage.load_biovpn_portals().unwrap();
+        assert_eq!(loaded.urls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_add_portal_modal_flow() {
+        let storage = InMemoryStorage::new();
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        // Press 'S' to open SyncManager
+        app.handle_key(KeyCode::Char('S')).await.unwrap();
+
+        // Press 'a' to open AddBioVpnPortal modal
+        app.handle_key(KeyCode::Char('a')).await.unwrap();
+        assert!(matches!(app.active_modal, ActiveModal::AddBioVpnPortal { .. }));
+
+        // Type "mirror.org/vpn/"
+        for c in "mirror.org/vpn/".chars() {
+            app.handle_key(KeyCode::Char(c)).await.unwrap();
+        }
+
+        // Hit Enter
+        app.handle_key(KeyCode::Enter).await.unwrap();
+
+        // Should return to SyncManager with normalized "https://mirror.org/vpn" active
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.selected_portal_url(), "https://mirror.org/vpn");
+            assert_eq!(st.portal_urls.len(), 3);
+            assert!(st.status_message.as_ref().unwrap().contains("Added portal mirror"));
+        } else {
+            panic!("Expected SyncManager modal after adding portal");
+        }
+
+        // Verify storage persisted the new portal
+        let loaded = app.storage.load_biovpn_portals().unwrap();
+        assert_eq!(loaded.selected.as_deref(), Some("https://mirror.org/vpn"));
+        assert!(loaded.urls.contains(&"https://mirror.org/vpn".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_account_cycling() {
+        let mut storage = InMemoryStorage::new();
+        let acc1 = Account::new("AccountOne");
+        let acc2 = Account::new("AccountTwo");
+        storage.save_account(&acc1).unwrap();
+        storage.save_account(&acc2).unwrap();
+
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        // Press 'S' to open SyncManager
+        app.handle_key(KeyCode::Char('S')).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.target_account_idx, Some(0));
+        } else {
+            panic!("Expected SyncManager modal");
+        }
+
+        // Tab -> AccountTwo
+        app.handle_key(KeyCode::Tab).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.target_account_idx, Some(1));
+        }
+
+        // Tab -> None (Unassigned)
+        app.handle_key(KeyCode::Tab).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.target_account_idx, None);
+        }
+
+        // Tab -> AccountOne
+        app.handle_key(KeyCode::Tab).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.target_account_idx, Some(0));
+        }
+
+        // BackTab -> None
+        app.handle_key(KeyCode::BackTab).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.target_account_idx, None);
+        }
+
+        // BackTab -> AccountTwo
+        app.handle_key(KeyCode::BackTab).await.unwrap();
+        if let ActiveModal::SyncManager(st) = &app.active_modal {
+            assert_eq!(st.target_account_idx, Some(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_direct_bundle_unassigned() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Create a fake zip in memory
+        let fake_zip = {
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zip.start_file("Frankfurt-SmartTCP.ovpn", options).unwrap();
+                use std::io::Write;
+                zip.write_all(b"remote 192.168.1.1 1194\nproto udp\n").unwrap();
+                zip.finish().unwrap();
+            }
+            buf
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\n\r\n",
+                    fake_zip.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&fake_zip).await;
+            }
+        });
+
+        let storage = InMemoryStorage::new();
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        let portal_url = format!("http://{}", local_addr);
+        let mut sync_state = SyncManagerState::new();
+        sync_state.portal_urls = vec![portal_url];
+        sync_state.selected_portal_idx = 0;
+        sync_state.target_account_idx = None; // Unassigned!
+
+        app.active_modal = ActiveModal::SyncManager(sync_state);
+        app.handle_key(KeyCode::Enter).await.unwrap();
+
+        assert_eq!(app.active_modal, ActiveModal::None);
+        assert_eq!(app.profiles.len(), 2); // 1 OpenVPN + 1 Cisco
+        assert_eq!(app.profiles[0].account_id, None);
+        assert_eq!(app.profiles[1].account_id, None);
+        assert!(app.logs.iter().any(|l| l.contains("imported 1 OpenVPN and 1 Cisco")));
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_batch_import_unassigned() {
+        let storage = InMemoryStorage::new();
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        let mut sync_state = SyncManagerState::new();
+        sync_state.selected_method_idx = 2; // Batch server import
+        sync_state.target_account_idx = None; // Unassigned
+
+        app.active_modal = ActiveModal::SyncManager(sync_state);
+        app.handle_key(KeyCode::Enter).await.unwrap();
+
+        assert!(matches!(app.active_modal, ActiveModal::BatchInput(_)));
+
+        // Type server entry
+        for c in "DirectServer 192.168.10.1:443".chars() {
+            app.handle_key(KeyCode::Char(c)).await.unwrap();
+        }
+        app.handle_key(KeyCode::Enter).await.unwrap();
+
+        assert_eq!(app.active_modal, ActiveModal::None);
+        assert_eq!(app.profiles.len(), 1);
+        assert_eq!(app.profiles[0].name, "DirectServer");
+        assert_eq!(app.profiles[0].account_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_app_delete_openvpn_profile_fs_storage_integration() {
+        use crate::infra::fs_storage::FsConfigStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        // Create an OpenVPN profile with a real file in openvpn dir
+        let fake_ovpn = tmp.path().join("source.ovpn");
+        std::fs::write(&fake_ovpn, "client\ndev tun\nremote 1.2.3.4 1194").unwrap();
+        let prof = storage.import_ovpn(&fake_ovpn, "Production OVPN").unwrap();
+        let ovpn_path = prof.ovpn_file.as_ref().unwrap().clone();
+        assert!(ovpn_path.exists());
+
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+        assert_eq!(app.profiles.len(), 1);
+
+        // Delete profile via 'x' and 'y'
+        app.active_pane = ActivePane::Profiles;
+        app.handle_key(KeyCode::Char('x')).await.unwrap();
+        assert!(matches!(app.active_modal, ActiveModal::ConfirmDelete { .. }));
+
+        app.handle_key(KeyCode::Char('y')).await.unwrap();
+        assert_eq!(app.active_modal, ActiveModal::None);
+        assert_eq!(app.profiles.len(), 0);
+
+        // Verify underlying .ovpn file is deleted from disk
+        assert!(!ovpn_path.exists());
+
+        // Reload profiles from storage: MUST NOT resurrect
+        app.reload_profiles();
+        assert_eq!(app.profiles.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_app_folder_delete_openvpn_profiles_cascade_fs_storage() {
+        use crate::infra::fs_storage::FsConfigStorage;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        let ovpn_dir = storage.protocol_dir(VpnProtocol::OpenVpn);
+        std::fs::create_dir_all(&ovpn_dir).unwrap();
+
+        // 1. BioVPN profile 1 inside folder "BioVPN/OpenVPN"
+        let f1 = ovpn_dir.join("germany.ovpn");
+        std::fs::write(&f1, "client\ndev tun\nremote 1.1.1.1 1194").unwrap();
+        let p1 = Profile::new_openvpn("germany (OVPN)", "1.1.1.1:1194", Some(f1.clone()))
+            .with_group("BioVPN/OpenVPN");
+        storage.save_profile(&p1).unwrap();
+
+        // 2. BioVPN profile 2 inside folder "BioVPN/OpenVPN"
+        let f2 = ovpn_dir.join("france.ovpn");
+        std::fs::write(&f2, "client\ndev tun\nremote 2.2.2.2 1194").unwrap();
+        let p2 = Profile::new_openvpn("france (OVPN)", "2.2.2.2:1194", Some(f2.clone()))
+            .with_group("BioVPN/OpenVPN");
+        storage.save_profile(&p2).unwrap();
+
+        // 3. Standalone profile outside BioVPN folder
+        let f3 = ovpn_dir.join("standalone.ovpn");
+        std::fs::write(&f3, "client\ndev tun\nremote 3.3.3.3 1194").unwrap();
+        let p3 = Profile::new_openvpn("standalone", "3.3.3.3:1194", Some(f3.clone()));
+        storage.save_profile(&p3).unwrap();
+
+        storage.save_folders(&["BioVPN".to_string(), "BioVPN/OpenVPN".to_string()]).unwrap();
+
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+        app.expanded_folders.insert("BioVPN".to_string());
+        app.expanded_folders.insert("BioVPN/OpenVPN".to_string());
+        assert_eq!(app.profiles.len(), 3);
+
+        // Find the BioVPN folder node in the tree
+        app.active_pane = ActivePane::Profiles;
+        let tree = app.visible_tree();
+        let biovpn_idx = tree
+            .iter()
+            .position(|node| match node {
+                crate::ui::tree::VisibleTreeNode::Folder { path, .. } => path == "BioVPN",
+                _ => false,
+            })
+            .expect("BioVPN folder node must exist");
+
+        app.selected_tree_idx = biovpn_idx;
+
+        // Press 'x' to initiate folder delete
+        app.handle_key(KeyCode::Char('x')).await.unwrap();
+        assert!(matches!(
+            app.active_modal,
+            ActiveModal::ConfirmDelete {
+                target: DeleteTarget::Folder { .. }
+            }
+        ));
+
+        // Confirm delete with 'y'
+        app.handle_key(KeyCode::Char('y')).await.unwrap();
+        assert_eq!(app.active_modal, ActiveModal::None);
+
+        // Verify underlying .ovpn files for BioVPN profiles are deleted from disk!
+        assert!(!f1.exists(), "germany.ovpn must be deleted");
+        assert!(!f2.exists(), "france.ovpn must be deleted");
+        // Standalone file must still exist
+        assert!(f3.exists(), "standalone.ovpn must remain intact");
+
+        // Reload profiles: Only standalone profile remains
+        app.reload_profiles();
+        assert_eq!(app.profiles.len(), 1);
+        assert_eq!(app.profiles[0].name, "standalone");
     }
 }
 
