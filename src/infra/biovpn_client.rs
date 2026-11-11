@@ -1,4 +1,4 @@
-use crate::ports::biovpn::BioVpnClient;
+use crate::ports::biovpn::{BioVpnClient, PortalSyncData};
 use anyhow::{Context, Result, anyhow};
 use png::Transformations;
 use std::future::Future;
@@ -164,6 +164,7 @@ pub fn solve_captcha_png(image_bytes: &[u8]) -> Option<String> {
 pub struct ReqwestBioVpnClient {
     base_url: String,
     client: reqwest::Client,
+    logger: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl ReqwestBioVpnClient {
@@ -184,7 +185,23 @@ impl ReqwestBioVpnClient {
         Ok(Self {
             base_url: base.to_string(),
             client,
+            logger: None,
         })
+    }
+
+    /// Attaches an asynchronous log callback for streaming real-time sync progress.
+    pub fn with_logger<F>(mut self, f: F) -> Self
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        self.logger = Some(std::sync::Arc::new(f));
+        self
+    }
+
+    fn log(&self, msg: impl Into<String>) {
+        if let Some(ref l) = self.logger {
+            l(msg.into());
+        }
     }
 
     /// Internal helper to extract the OpenVPN zip download link from dashboard HTML.
@@ -267,7 +284,7 @@ impl BioVpnClient for ReqwestBioVpnClient {
         &self,
         username: &str,
         password: &str,
-    ) -> impl Future<Output = Result<Vec<u8>>> + Send {
+    ) -> impl Future<Output = Result<PortalSyncData>> + Send {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let username = username.to_string();
@@ -278,7 +295,13 @@ impl BioVpnClient for ReqwestBioVpnClient {
             let mut clientarea_url = format!("{}/clientarea/", base_url);
             let mut login_success = false;
 
+            this.log(format!(
+                "[SYNC] Connecting to BioVPN portal at {}...",
+                base_url
+            ));
+
             for attempt in 1..=3 {
+                this.log(format!("[SYNC] Authenticating (attempt {}/3)...", attempt));
                 // 1. Initial GET to clientarea to establish session cookies
                 let init_res = client.get(&clientarea_url).send().await?;
                 if init_res.status() == reqwest::StatusCode::NOT_FOUND {
@@ -299,6 +322,10 @@ impl BioVpnClient for ReqwestBioVpnClient {
                 let captcha_code = solve_captcha_png(&cap_bytes).ok_or_else(|| {
                     anyhow!("Unable to automatically solve portal security code verification")
                 })?;
+                this.log(format!(
+                    "[SYNC] Solved security verification: {}",
+                    captcha_code
+                ));
 
                 // 3. Submit authentication form
                 let params = [
@@ -318,6 +345,7 @@ impl BioVpnClient for ReqwestBioVpnClient {
                     break;
                 } else if post_text.contains("مشخصات ورود") && post_text.contains("کد امنیتی")
                 {
+                    this.log("[WARN] Portal login returned invalid credentials or security code mismatch");
                     if attempt == 3 {
                         return Err(anyhow!(
                             "Login failed: Invalid username/password or incorrect security code."
@@ -333,6 +361,8 @@ impl BioVpnClient for ReqwestBioVpnClient {
                 return Err(anyhow!("Authentication failed for user '{}'", username));
             }
 
+            this.log("[SYNC] Authentication succeeded. Retrieving user dashboard...");
+
             // 4. Access clientarea dashboard to find bundle link
             let dash_res = client.get(&clientarea_url).send().await?;
             let dash_text = dash_res.text().await.unwrap_or_default();
@@ -340,6 +370,11 @@ impl BioVpnClient for ReqwestBioVpnClient {
             let download_url = this
                 .find_zip_download_url(&dash_text)
                 .unwrap_or_else(|| format!("{}/dl/BioVPN-SmartTCP.zip", base_url));
+
+            this.log(format!(
+                "[SYNC] Downloading configuration bundle ZIP from {}...",
+                download_url
+            ));
 
             // 5. Download the zip bundle
             let zip_res = client.get(&download_url).send().await?;
@@ -352,18 +387,129 @@ impl BioVpnClient for ReqwestBioVpnClient {
             }
 
             let zip_bytes = zip_res.bytes().await?;
-            Ok(zip_bytes.to_vec())
+            this.log(format!(
+                "[SYNC] ZIP bundle downloaded ({} bytes).",
+                zip_bytes.len()
+            ));
+
+            // 6. Download individual OpenVPN configs for table servers sequentially
+            let mut individual_ovpns = Vec::new();
+            let mut logs = Vec::new();
+
+            if let Ok(parsed) = crate::domain::importer::ProfileImporter::parse_portal_html(
+                &dash_text,
+                None,
+                Some(&base_url),
+            ) {
+                let servers_with_ovpn: Vec<_> = parsed
+                    .servers
+                    .into_iter()
+                    .filter(|s| s.ovpn_download_url.is_some())
+                    .collect();
+
+                let total = servers_with_ovpn.len();
+                if total > 0 {
+                    this.log(format!(
+                        "[SYNC] Downloading {} OpenVPN configs from dashboard table...",
+                        total
+                    ));
+                }
+
+                for (idx, s) in servers_with_ovpn.into_iter().enumerate() {
+                    let ovpn_url = s.ovpn_download_url.as_ref().unwrap();
+                    this.log(format!(
+                        "[SYNC] [{}/{}] Downloading OpenVPN config for '{}'...",
+                        idx + 1,
+                        total,
+                        s.name
+                    ));
+                    let resp = client
+                        .get(ovpn_url)
+                        .timeout(std::time::Duration::from_secs(15))
+                        .send()
+                        .await;
+
+                    match resp {
+                        Ok(res) if res.status().is_success() => match res.text().await {
+                            Ok(text) if !text.trim().is_empty() => {
+                                let filename =
+                                    crate::domain::importer::ProfileImporter::derive_ovpn_filename(
+                                        ovpn_url,
+                                        &s.country_group,
+                                        &s.name,
+                                    );
+                                individual_ovpns.push(crate::ports::biovpn::DownloadedOvpnConfig {
+                                    server_name: s.name.clone(),
+                                    country_group: s.country_group.clone(),
+                                    filename,
+                                    content: text,
+                                });
+                                this.log(format!(
+                                    "[SYNC] [{}/{}] Saved OpenVPN config for '{}'",
+                                    idx + 1,
+                                    total,
+                                    s.name
+                                ));
+                            }
+                            Ok(_) => {
+                                let warn = format!(
+                                    "Warning: Empty OpenVPN config returned for '{}' from {}",
+                                    s.name, ovpn_url
+                                );
+                                this.log(format!("[WARN] {}", warn));
+                                logs.push(warn);
+                            }
+                            Err(e) => {
+                                let warn = format!(
+                                    "Warning: Failed reading OpenVPN response for '{}': {}",
+                                    s.name, e
+                                );
+                                this.log(format!("[WARN] {}", warn));
+                                logs.push(warn);
+                            }
+                        },
+                        Ok(res) => {
+                            let warn = format!(
+                                "Warning: Failed to download OpenVPN config for '{}' from {} (HTTP {})",
+                                s.name,
+                                ovpn_url,
+                                res.status()
+                            );
+                            this.log(format!("[WARN] {}", warn));
+                            logs.push(warn);
+                        }
+                        Err(e) => {
+                            let warn = format!(
+                                "Warning: Error downloading OpenVPN config for '{}' from {}: {}",
+                                s.name, ovpn_url, e
+                            );
+                            this.log(format!("[WARN] {}", warn));
+                            logs.push(warn);
+                        }
+                    }
+                }
+            }
+
+            Ok(PortalSyncData {
+                zip_bytes: zip_bytes.to_vec(),
+                dashboard_html: Some(dash_text),
+                individual_ovpns,
+                logs,
+            })
         }
     }
 
-    fn fetch_direct_bundle(
-        &self,
-    ) -> impl Future<Output = Result<Vec<u8>>> + Send {
+    fn fetch_direct_bundle(&self) -> impl Future<Output = Result<PortalSyncData>> + Send {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
+        let this = self.clone();
 
         async move {
             let download_url = format!("{}/dl/BioVPN-SmartTCP.zip", base_url);
+            this.log(format!(
+                "[SYNC] Downloading configuration bundle directly from {}...",
+                download_url
+            ));
             let zip_res = client.get(&download_url).send().await?;
             if !zip_res.status().is_success() {
                 return Err(anyhow!(
@@ -374,7 +520,16 @@ impl BioVpnClient for ReqwestBioVpnClient {
             }
 
             let zip_bytes = zip_res.bytes().await?;
-            Ok(zip_bytes.to_vec())
+            this.log(format!(
+                "[SYNC] Direct configuration bundle downloaded ({} bytes).",
+                zip_bytes.len()
+            ));
+            Ok(PortalSyncData {
+                zip_bytes: zip_bytes.to_vec(),
+                dashboard_html: None,
+                individual_ovpns: Vec::new(),
+                logs: Vec::new(),
+            })
         }
     }
 }
@@ -501,7 +656,7 @@ mod tests {
                 }
                 let req = String::from_utf8_lossy(&buf[..n]);
 
-                if req.starts_with("GET /clientarea/") && !req.contains("Cookie:") {
+                if req.starts_with("GET /clientarea/") && !req.to_lowercase().contains("cookie:") {
                     let resp = "HTTP/1.1 200 OK\r\nSet-Cookie: PHPSESSID=mock123; Path=/\r\nContent-Length: 20\r\n\r\n<form>login</form>";
                     let _ = socket.write_all(resp.as_bytes()).await;
                 } else if req.starts_with("GET /captcha.php") {
@@ -556,11 +711,12 @@ mod tests {
 
         let client = ReqwestBioVpnClient::new(Some(&base_url)).unwrap();
         let bundle = client.fetch_bundle("testuser", "testpass").await.unwrap();
-        assert_eq!(bundle, b"PK\x03\x04mockzipcontent");
+        assert_eq!(bundle.zip_bytes, b"PK\x03\x04mockzipcontent");
+        assert!(bundle.dashboard_html.is_some());
 
         // Test direct bundle fetch
         let direct_bundle = client.fetch_direct_bundle().await.unwrap();
-        assert_eq!(direct_bundle, b"PK\x03\x04mockzipcontent");
+        assert_eq!(direct_bundle.zip_bytes, b"PK\x03\x04mockzipcontent");
 
         // Test invalid credentials error path
         let err = client.fetch_bundle("testuser", "wrongpass").await;
@@ -612,5 +768,101 @@ mod tests {
             </div>
         "#;
         assert_eq!(client.find_zip_download_url(html_only_installers), None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_bundle_with_table_ovpn_downloads() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{}", port);
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let captcha_png = create_synthetic_captcha_png("1234");
+            let fake_zip = b"PK\x03\x04mockzipcontent";
+
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+
+                if req.starts_with("GET /clientarea/") && !req.to_lowercase().contains("cookie:") {
+                    let resp = "HTTP/1.1 200 OK\r\nConnection: close\r\nSet-Cookie: PHPSESSID=mock123; Path=/\r\nContent-Length: 20\r\n\r\n<form>login</form>";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                } else if req.starts_with("GET /captcha.php") {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                        captcha_png.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(&captcha_png).await;
+                } else if req.starts_with("POST /clientarea/") {
+                    let body = "<html><body>پنل کاربری کاربر خوش آمدید</body></html>";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.as_bytes().len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                } else if req
+                    .starts_with("GET /clientarea/index.php?download_ovpn=1&server=OPNL.cdntak.com")
+                {
+                    let body = "client\ndev tun\nremote 45.93.169.132 1194\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.as_bytes().len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                } else if req
+                    .starts_with("GET /clientarea/index.php?download_ovpn=1&server=OPDE.cdntak.com")
+                {
+                    let resp = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                } else if req.starts_with("GET /clientarea/") {
+                    let body = r#"<html><body><a href="/dl/BioVPN-SmartTCP.zip">Download</a><table><tr class="bio-server-group-toggle"><th>هلند</th></tr><tr class="bio-server-child-row"><th>هلند هوشمند</th><td><span class="server-address">NL1.cdntak.com</span></td><td><a class="bio-ovpn-download" href="/clientarea/index.php?download_ovpn=1&amp;server=OPNL.cdntak.com">دانلود کانفیگ</a></td></tr><tr class="bio-server-child-row"><th>آلمان هوشمند</th><td><span class="server-address">DE1.cdntak.com</span></td><td><a class="bio-ovpn-download" href="/clientarea/index.php?download_ovpn=1&amp;server=OPDE.cdntak.com">دانلود کانفیگ</a></td></tr></table></body></html>"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+                        body.as_bytes().len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                } else if req.starts_with("GET /dl/BioVPN-SmartTCP.zip") {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/zip\r\nContent-Length: {}\r\n\r\n",
+                        fake_zip.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(fake_zip).await;
+                } else {
+                    let resp =
+                        "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let client = ReqwestBioVpnClient::new(Some(&base_url)).unwrap();
+        let bundle = client.fetch_bundle("testuser", "testpass").await.unwrap();
+
+        assert_eq!(bundle.zip_bytes, b"PK\x03\x04mockzipcontent");
+        assert_eq!(bundle.individual_ovpns.len(), 1);
+        let ovpn = &bundle.individual_ovpns[0];
+        assert_eq!(ovpn.server_name, "هلند هوشمند");
+        assert_eq!(ovpn.country_group, "Netherlands");
+        assert_eq!(ovpn.filename, "OPNL.cdntak.com.ovpn");
+        assert!(ovpn.content.contains("remote 45.93.169.132 1194"));
+
+        assert_eq!(bundle.logs.len(), 1);
+        assert!(bundle.logs[0].contains("آلمان هوشمند"));
+        assert!(bundle.logs[0].contains("HTTP 500"));
     }
 }

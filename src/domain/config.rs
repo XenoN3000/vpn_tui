@@ -196,6 +196,38 @@ pub struct ProxyEndpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolDefaults {
+    #[serde(default = "default_openconnect_flags")]
+    pub openconnect_flags: Vec<String>,
+    #[serde(default = "default_openvpn_flags")]
+    pub openvpn_flags: Vec<String>,
+}
+
+pub fn default_openconnect_flags() -> Vec<String> {
+    vec![
+        "--protocol=anyconnect".to_string(),
+        "--no-dtls".to_string(),
+        "--pfs".to_string(),
+    ]
+}
+
+pub fn default_openvpn_flags() -> Vec<String> {
+    vec![
+        "--dev tun".to_string(),
+        "--redirect-gateway def1".to_string(),
+    ]
+}
+
+impl Default for ProtocolDefaults {
+    fn default() -> Self {
+        Self {
+            openconnect_flags: default_openconnect_flags(),
+            openvpn_flags: default_openvpn_flags(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub id: ProfileId,
     pub name: String,
@@ -221,6 +253,8 @@ pub struct Profile {
     pub proxy_core: ProxyCore,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_endpoint: Option<ProxyEndpoint>,
+    #[serde(default)]
+    pub inherit_defaults: bool,
 }
 
 impl Profile {
@@ -249,6 +283,7 @@ impl Profile {
             proxy_routing_mode: ProxyRoutingMode::default(),
             proxy_core: ProxyCore::default(),
             proxy_endpoint: None,
+            inherit_defaults: true,
         }
     }
 
@@ -281,6 +316,7 @@ impl Profile {
             proxy_routing_mode: ProxyRoutingMode::default(),
             proxy_core: ProxyCore::default(),
             proxy_endpoint: None,
+            inherit_defaults: true,
         }
     }
 
@@ -313,6 +349,7 @@ impl Profile {
             proxy_routing_mode: ProxyRoutingMode::default(),
             proxy_core: ProxyCore::default(),
             proxy_endpoint: None,
+            inherit_defaults: false,
         }
     }
 
@@ -348,6 +385,11 @@ impl Profile {
 
     pub fn with_proxy_endpoint(mut self, endpoint: ProxyEndpoint) -> Self {
         self.proxy_endpoint = Some(endpoint);
+        self
+    }
+
+    pub fn with_inherit_defaults(mut self, inherit: bool) -> Self {
+        self.inherit_defaults = inherit;
         self
     }
 }
@@ -497,5 +539,67 @@ mod tests {
         assert_eq!(deserialized.protocol, VpnProtocol::V2Ray);
         assert_eq!(deserialized.proxy_routing_mode, ProxyRoutingMode::Tun);
         assert_eq!(deserialized.proxy_core, ProxyCore::SingBox);
+    }
+
+    #[test]
+    fn test_protocol_defaults_values_and_serialization() {
+        let defaults = ProtocolDefaults::default();
+        assert_eq!(
+            defaults.openconnect_flags,
+            vec!["--protocol=anyconnect", "--no-dtls", "--pfs"]
+        );
+        assert_eq!(
+            defaults.openvpn_flags,
+            vec!["--dev tun", "--redirect-gateway def1"]
+        );
+
+        let toml_str = toml::to_string(&defaults).expect("serialize protocol defaults");
+        assert!(toml_str.contains("openconnect_flags"));
+        assert!(toml_str.contains("openvpn_flags"));
+        assert!(toml_str.contains("--pfs"));
+
+        let deserialized: ProtocolDefaults =
+            toml::from_str(&toml_str).expect("deserialize protocol defaults");
+        assert_eq!(deserialized, defaults);
+
+        // Missing fields in TOML should use defaults
+        let empty_toml = "";
+        let fallback: ProtocolDefaults =
+            toml::from_str(empty_toml).expect("deserialize empty toml for defaults");
+        assert_eq!(fallback, defaults);
+    }
+
+    #[test]
+    fn test_profile_inherit_defaults_backward_compatibility() {
+        // Newly instantiated profiles default to inherit_defaults = true for OpenConnect and OpenVPN
+        let oc = Profile::new_openconnect("Test OC", "vpn.example.com:443");
+        assert!(oc.inherit_defaults);
+
+        let ovpn = Profile::new_openvpn("Test OVPN", "vpn.example.com:1194", None);
+        assert!(ovpn.inherit_defaults);
+
+        let v2 = Profile::new_v2ray("Test V2", "vpn.example.com:443", None);
+        assert!(!v2.inherit_defaults);
+
+        // Builder method
+        let oc_disabled = oc.clone().with_inherit_defaults(false);
+        assert!(!oc_disabled.inherit_defaults);
+
+        // Serialization includes inherit_defaults
+        let toml_str = toml::to_string(&oc).unwrap();
+        assert!(toml_str.contains("inherit_defaults = true"));
+        let deserialized: Profile = toml::from_str(&toml_str).unwrap();
+        assert!(deserialized.inherit_defaults);
+
+        // Backward compatibility: legacy TOML omitting inherit_defaults deserializes as false
+        let legacy_toml = r#"
+            name = "Legacy Node"
+            id = "legacy-node"
+            protocol = "openconnect"
+            endpoint = "legacy.vpn.net:443"
+            flags = []
+        "#;
+        let legacy_profile: Profile = toml::from_str(legacy_toml).unwrap();
+        assert!(!legacy_profile.inherit_defaults);
     }
 }

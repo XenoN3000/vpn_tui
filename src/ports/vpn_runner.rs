@@ -17,17 +17,7 @@ pub enum CertProbeResult {
     Failed(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogEvent {
-    Stdout(String),
-    Stderr(String),
-    StatusChange(String),
-    TunnelUp {
-        interface: String,
-        ip: Option<String>,
-    },
-    ProcessExited(i32),
-}
+pub use crate::domain::state::LogEvent;
 
 pub trait VpnRunner: Send + Sync {
     fn connect(
@@ -51,6 +41,8 @@ pub trait VpnRunner: Send + Sync {
         &self,
         profile: &Profile,
     ) -> impl std::future::Future<Output = CertProbeResult> + Send;
+
+    fn set_defaults(&self, _defaults: crate::domain::config::ProtocolDefaults) {}
 }
 
 #[derive(Debug, Clone)]

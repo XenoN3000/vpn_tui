@@ -1,4 +1,4 @@
-use super::config::ProfileId;
+use super::config::{Profile, ProfileId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +82,34 @@ impl LatencyState {
             LatencyState::Error(_) => "Error".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogEvent {
+    Stdout(String),
+    Stderr(String),
+    StatusChange(String),
+    TunnelUp {
+        interface: String,
+        ip: Option<String>,
+    },
+    ProcessExited(i32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppEvent {
+    VpnLog(LogEvent),
+    PingResult {
+        profile_id: ProfileId,
+        latency: LatencyState,
+    },
+    SyncProgress(String),
+    BioVpnSyncCompleted {
+        profiles: Vec<Profile>,
+        folders: Vec<String>,
+        summary_log: String,
+    },
+    BioVpnSyncFailed(String),
 }
 
 #[cfg(test)]

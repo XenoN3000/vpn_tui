@@ -2,7 +2,7 @@ use crate::domain::state::LatencyState;
 use std::collections::HashMap;
 use std::time::Duration;
 
-pub trait Pinger: Send + Sync {
+pub trait Pinger: Send + Sync + Clone + 'static {
     fn ping(
         &self,
         endpoint: &str,

@@ -70,6 +70,9 @@ pub fn render_modal(
         ActiveModal::SubscriptionManager(sub_state) => {
             render_subscription_manager_modal(f, sub_state, theme);
         }
+        ActiveModal::Defaults(defaults_state) => {
+            render_defaults_modal(f, defaults_state, theme);
+        }
     }
 }
 
@@ -224,13 +227,84 @@ pub fn render_new_folder_modal(
     f.render_widget(p, area);
 }
 
+pub fn render_defaults_modal(f: &mut Frame, state: &crate::app::DefaultsModalState, theme: &Theme) {
+    let area = centered_rect(68, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border_active)
+        .title(" Protocol Default Flags ");
+
+    let cursor = |idx: usize| {
+        if state.field_idx == idx { "> " } else { "  " }
+    };
+    let field_style = |idx: usize| {
+        if state.field_idx == idx {
+            theme.highlight
+        } else {
+            theme.text
+        }
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Configure global default flags applied when inheritance is enabled:",
+        theme.footer_desc,
+    ));
+    lines.push(Line::raw(""));
+
+    // Field 0: OpenConnect Defaults
+    lines.push(Line::from(vec![
+        Span::styled(cursor(0), theme.footer_key),
+        Span::styled("OpenConnect Defaults: ", field_style(0)),
+        Span::raw(format!("{}_", state.oc_flags)),
+    ]));
+    lines.push(Line::styled(
+        "    Standard: --protocol=anyconnect --no-dtls --pfs",
+        theme.footer_desc,
+    ));
+    lines.push(Line::raw(""));
+
+    // Field 1: OpenVPN Defaults
+    lines.push(Line::from(vec![
+        Span::styled(cursor(1), theme.footer_key),
+        Span::styled("OpenVPN Defaults:     ", field_style(1)),
+        Span::raw(format!("{}_", state.ovpn_flags)),
+    ]));
+    lines.push(Line::styled(
+        "    Standard: --dev tun --redirect-gateway def1",
+        theme.footer_desc,
+    ));
+
+    if let Some(err) = &state.error_msg {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(format!("Error: {}", err), theme.failed));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Tab/BackTab]", theme.footer_key),
+        Span::styled(" Switch Field   ", theme.footer_desc),
+        Span::styled("[Enter]", theme.footer_key),
+        Span::styled(" Save   ", theme.footer_desc),
+        Span::styled("[Esc]", theme.footer_key),
+        Span::styled(" Cancel", theme.footer_desc),
+    ]));
+
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, area);
+}
+
 pub fn render_config_adder_modal(
     f: &mut Frame,
     adder: &crate::app::ConfigAdderState,
     accounts: &[crate::domain::account::Account],
     theme: &Theme,
 ) {
-    let area = centered_rect(74, 82, f.area());
+    let area = centered_rect(76, 90, f.area());
     f.render_widget(Clear, area);
 
     let cursor = |idx: usize| {
@@ -252,16 +326,18 @@ pub fn render_config_adder_modal(
         .unwrap_or("(None)");
 
     let mut lines = Vec::new();
+    let mut field_line_indices = Vec::new();
 
     // Field 0: Protocol
+    field_line_indices.push(lines.len());
     lines.push(Line::from(vec![
         Span::styled(cursor(0), theme.footer_key),
         Span::styled("Protocol:       ", field_style(0)),
         Span::raw(format!("< {} > (Space to change)", adder.protocol)),
     ]));
-    lines.push(Line::raw(""));
 
     // Field 1: Account
+    field_line_indices.push(lines.len());
     lines.push(Line::from(vec![
         Span::styled(cursor(1), theme.footer_key),
         Span::styled("Parent Account: ", field_style(1)),
@@ -274,46 +350,47 @@ pub fn render_config_adder_modal(
             let variant = crate::app::OC_VARIANTS[adder.oc_variant_idx];
 
             // Field 2: Profile Name
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(2), theme.footer_key),
                 Span::styled("Profile Name:   ", field_style(2)),
                 Span::raw(format!("{}_", adder.oc_name)),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 3: Endpoint
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(3), theme.footer_key),
                 Span::styled("Gateway/Host:   ", field_style(3)),
                 Span::raw(format!("{}_", adder.oc_endpoint)),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 4: Protocol Variant
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(4), theme.footer_key),
                 Span::styled("Variant:        ", field_style(4)),
                 Span::raw(format!("< {} > (Space to change)", variant)),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 5: Authgroup
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(5), theme.footer_key),
                 Span::styled("Authgroup:      ", field_style(5)),
                 Span::raw(format!("{}_", adder.oc_authgroup)),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 6: Servercert
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(6), theme.footer_key),
                 Span::styled("Servercert Pin: ", field_style(6)),
                 Span::raw(format!("{}_", adder.oc_servercert)),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 7: SSL Policy
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(7), theme.footer_key),
                 Span::styled("SSL Policy:     ", field_style(7)),
@@ -321,28 +398,38 @@ pub fn render_config_adder_modal(
             ]));
             lines.push(Line::raw(""));
 
-            // Field 8: Preset --no-dtls
-            let dtls_check = if adder.oc_no_dtls { "[x]" } else { "[ ]" };
+            // Field 8: Inherit Defaults
+            let inherit_check = if adder.inherit_defaults { "[x]" } else { "[ ]" };
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(8), theme.footer_key),
-                Span::styled("Preset Flags:   ", field_style(8)),
-                Span::raw(format!("{} --no-dtls (Space to toggle)", dtls_check)),
+                Span::styled("Default Flags:  ", field_style(8)),
+                Span::raw(format!("{} Inherit Default Flags (Space to toggle)", inherit_check)),
             ]));
-            lines.push(Line::raw(""));
 
-            // Field 9: Custom Flags
+            // Field 9: Preset --no-dtls
+            let dtls_check = if adder.oc_no_dtls { "[x]" } else { "[ ]" };
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(9), theme.footer_key),
-                Span::styled("Custom Flags:   ", field_style(9)),
+                Span::styled("Preset Flags:   ", field_style(9)),
+                Span::raw(format!("{} --no-dtls (Space to toggle)", dtls_check)),
+            ]));
+
+            // Field 10: Custom Flags
+            field_line_indices.push(lines.len());
+            lines.push(Line::from(vec![
+                Span::styled(cursor(10), theme.footer_key),
+                Span::styled("Custom Flags:   ", field_style(10)),
                 Span::raw(format!("{}_", adder.oc_custom_flags)),
             ]));
             lines.push(Line::raw(""));
 
-            // Field 10: Group / Folder
+            // Field 11: Group / Folder
             let folder_display = adder.selected_folder_display();
             let mut folder_spans = vec![
-                Span::styled(cursor(10), theme.footer_key),
-                Span::styled("Group / Folder: ", field_style(10)),
+                Span::styled(cursor(11), theme.footer_key),
+                Span::styled("Group / Folder: ", field_style(11)),
             ];
             if adder.is_on_new_folder() {
                 folder_spans.push(Span::raw(format!(
@@ -357,27 +444,29 @@ pub fn render_config_adder_modal(
                 folder_spans.push(Span::raw(format!("< {} >", folder_display)));
                 folder_spans.push(Span::styled("  (Space/←/→ to cycle)", theme.footer_desc));
             }
+            field_line_indices.push(lines.len());
             lines.push(Line::from(folder_spans));
         }
         crate::domain::config::VpnProtocol::OpenVpn => {
             // Field 2: Profile Name
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(2), theme.footer_key),
                 Span::styled("Profile Name:   ", field_style(2)),
                 Span::raw(format!("{}_", adder.ovpn_name)),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 3: .ovpn File Path
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(3), theme.footer_key),
                 Span::styled(".ovpn File:     ", field_style(3)),
                 Span::raw(format!("{}_", adder.ovpn_path)),
                 Span::styled("  [Tab: Complete | F2: Browse]", theme.footer_desc),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 4: Remote Override
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(4), theme.footer_key),
                 Span::styled("Remote Override:", field_style(4)),
@@ -385,41 +474,51 @@ pub fn render_config_adder_modal(
             ]));
             lines.push(Line::raw(""));
 
-            // Field 5: --redirect-gateway def1
+            // Field 5: Inherit Defaults
+            let inherit_check = if adder.inherit_defaults { "[x]" } else { "[ ]" };
+            field_line_indices.push(lines.len());
+            lines.push(Line::from(vec![
+                Span::styled(cursor(5), theme.footer_key),
+                Span::styled("Default Flags:  ", field_style(5)),
+                Span::raw(format!("{} Inherit Default Flags (Space to toggle)", inherit_check)),
+            ]));
+
+            // Field 6: --redirect-gateway def1
             let gw_check = if adder.ovpn_redirect_gateway {
                 "[x]"
             } else {
                 "[ ]"
             };
-            lines.push(Line::from(vec![
-                Span::styled(cursor(5), theme.footer_key),
-                Span::styled("Preset Flags:   ", field_style(5)),
-                Span::raw(format!("{} --redirect-gateway def1 (Space)", gw_check)),
-            ]));
-            lines.push(Line::raw(""));
-
-            // Field 6: --dev tun
-            let tun_check = if adder.ovpn_dev_tun { "[x]" } else { "[ ]" };
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(6), theme.footer_key),
                 Span::styled("Preset Flags:   ", field_style(6)),
-                Span::raw(format!("{} --dev tun (Space)", tun_check)),
+                Span::raw(format!("{} --redirect-gateway def1 (Space)", gw_check)),
             ]));
-            lines.push(Line::raw(""));
 
-            // Field 7: Custom Flags
+            // Field 7: --dev tun
+            let tun_check = if adder.ovpn_dev_tun { "[x]" } else { "[ ]" };
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(7), theme.footer_key),
-                Span::styled("Custom Flags:   ", field_style(7)),
+                Span::styled("Preset Flags:   ", field_style(7)),
+                Span::raw(format!("{} --dev tun (Space)", tun_check)),
+            ]));
+
+            // Field 8: Custom Flags
+            field_line_indices.push(lines.len());
+            lines.push(Line::from(vec![
+                Span::styled(cursor(8), theme.footer_key),
+                Span::styled("Custom Flags:   ", field_style(8)),
                 Span::raw(format!("{}_", adder.ovpn_custom_flags)),
             ]));
             lines.push(Line::raw(""));
 
-            // Field 8: Group / Folder
+            // Field 9: Group / Folder
             let folder_display = adder.selected_folder_display();
             let mut folder_spans = vec![
-                Span::styled(cursor(8), theme.footer_key),
-                Span::styled("Group / Folder: ", field_style(8)),
+                Span::styled(cursor(9), theme.footer_key),
+                Span::styled("Group / Folder: ", field_style(9)),
             ];
             if adder.is_on_new_folder() {
                 folder_spans.push(Span::raw(format!(
@@ -434,18 +533,20 @@ pub fn render_config_adder_modal(
                 folder_spans.push(Span::raw(format!("< {} >", folder_display)));
                 folder_spans.push(Span::styled("  (Space/←/→ to cycle)", theme.footer_desc));
             }
+            field_line_indices.push(lines.len());
             lines.push(Line::from(folder_spans));
         }
         crate::domain::config::VpnProtocol::V2Ray => {
             // Field 2: Profile Name
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(2), theme.footer_key),
                 Span::styled("Profile Name:   ", field_style(2)),
                 Span::raw(format!("{}_", adder.v2_name)),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 3: Share Link / Subscription URL
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(3), theme.footer_key),
                 Span::styled("Share / Sub URL:", field_style(3)),
@@ -455,27 +556,27 @@ pub fn render_config_adder_modal(
                     theme.footer_desc,
                 ),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 4: JSON Config Path
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(4), theme.footer_key),
                 Span::styled("JSON Config:    ", field_style(4)),
                 Span::raw(format!("{}_", adder.v2_config_path)),
                 Span::styled("  [Tab: Complete | F2: Browse]", theme.footer_desc),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 5: Routing Mode
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(5), theme.footer_key),
                 Span::styled("Routing Mode:   ", field_style(5)),
                 Span::raw(format!("< {} >", adder.v2_routing_mode.display_name())),
                 Span::styled("  (Space/←/→ to toggle)", theme.footer_desc),
             ]));
-            lines.push(Line::raw(""));
 
             // Field 6: Core Engine
+            field_line_indices.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(cursor(6), theme.footer_key),
                 Span::styled("Core Engine:    ", field_style(6)),
@@ -501,6 +602,7 @@ pub fn render_config_adder_modal(
                 folder_spans.push(Span::raw(format!("< {} >", folder_display)));
                 folder_spans.push(Span::styled("  (Space/←/→ to cycle)", theme.footer_desc));
             }
+            field_line_indices.push(lines.len());
             lines.push(Line::from(folder_spans));
 
             if adder.v2_link.starts_with("http://") || adder.v2_link.starts_with("https://") {
@@ -510,6 +612,7 @@ pub fn render_config_adder_modal(
                 } else {
                     "[ ]"
                 };
+                field_line_indices.push(lines.len());
                 lines.push(Line::from(vec![
                     Span::styled(cursor(8), theme.footer_key),
                     Span::styled("Subscription:   ", field_style(8)),
@@ -560,7 +663,23 @@ pub fn render_config_adder_modal(
         .border_style(theme.border_active)
         .title(title);
 
-    let p = Paragraph::new(lines).block(block);
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let active_line = field_line_indices
+        .get(adder.field_idx)
+        .copied()
+        .unwrap_or(0);
+    let scroll_y = if inner_height > 0 && lines.len() > inner_height {
+        let max_scroll = lines.len().saturating_sub(inner_height);
+        if active_line >= inner_height {
+            (active_line + 2).saturating_sub(inner_height).min(max_scroll) as u16
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let p = Paragraph::new(lines).block(block).scroll((scroll_y, 0));
     f.render_widget(p, area);
 }
 
@@ -1267,6 +1386,8 @@ pub mod config_adder {
         assert!(buffer.contains("Servercert Pin:"));
         assert!(buffer.contains("SSL Policy:"));
         assert!(buffer.contains("Prompt on Mismatch"));
+        assert!(buffer.contains("Inherit Default Flags"));
+        assert!(buffer.contains("[x]"));
         assert!(buffer.contains("--no-dtls"));
         assert!(buffer.contains("Group / Folder:"));
     }
@@ -1292,6 +1413,8 @@ pub mod config_adder {
         assert!(buffer.contains("New Configuration (OpenVPN)"));
         assert!(buffer.contains("/home/user/vpn.ovpn"));
         assert!(buffer.contains("F2") && buffer.contains("Browse"));
+        assert!(buffer.contains("Inherit Default Flags"));
+        assert!(buffer.contains("[x]"));
         assert!(buffer.contains("--redirect-gateway def1"));
         assert!(buffer.contains("Group / Folder:"));
     }
@@ -1777,5 +1900,31 @@ pub mod sync_manager {
         assert!(buffer.contains("Switch Portal"));
         assert!(buffer.contains("Add Portal"));
         assert!(buffer.contains("Delete Portal"));
+    }
+
+    #[test]
+    fn test_render_defaults_modal() {
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let defaults = crate::domain::config::ProtocolDefaults::default();
+        let mut state = crate::app::DefaultsModalState::new(&defaults);
+        state.error_msg = Some("Test error message".into());
+
+        terminal
+            .draw(|f| {
+                render_defaults_modal(f, &state, &theme);
+            })
+            .unwrap();
+
+        let buffer = format!("{:?}", terminal.backend().buffer());
+        assert!(buffer.contains("Protocol Default Flags"));
+        assert!(buffer.contains("OpenConnect Defaults:"));
+        assert!(buffer.contains("--protocol=anyconnect --no-dtls --pfs"));
+        assert!(buffer.contains("OpenVPN Defaults:"));
+        assert!(buffer.contains("--dev tun --redirect-gateway def1"));
+        assert!(buffer.contains("Test error message"));
+        assert!(buffer.contains("Switch Field"));
+        assert!(buffer.contains("Save"));
     }
 }

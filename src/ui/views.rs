@@ -164,6 +164,10 @@ fn render_header<S: ConfigStorage, R: VpnRunner, P: Pinger>(
         row1_spans.push(Span::raw("  "));
         row1_spans.push(Span::styled(uptime_str, theme.footer_desc));
     }
+    if app.is_syncing {
+        row1_spans.push(Span::raw("  "));
+        row1_spans.push(Span::styled("[SYNCING...]", theme.connecting));
+    }
     f.render_widget(Paragraph::new(Line::from(row1_spans)), left_rows[0]);
 
     let gateway_info = if let Some(prof) = app.selected_profile() {
@@ -302,7 +306,7 @@ fn render_dashboard<S: ConfigStorage, R: VpnRunner, P: Pinger>(
     let right_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Details & Flags (full width)
+            Constraint::Length(9), // Details & Flags (full width)
             Constraint::Min(8),    // Connection Logs (expanded height)
         ])
         .split(main_cols[1]);
@@ -517,7 +521,11 @@ fn render_profiles_list<S: ConfigStorage, R: VpnRunner, P: Pinger>(
                         profile_idx, depth, ..
                     } => {
                         let prof = &app.profiles[*profile_idx];
-                        let indent = "  ".repeat(*depth);
+                        let indent = if *depth > 0 {
+                            format!("{}  ", "  ".repeat(*depth))
+                        } else {
+                            String::new()
+                        };
                         let proto_badge = match prof.protocol {
                             crate::domain::config::VpnProtocol::OpenConnect => "[OC]",
                             crate::domain::config::VpnProtocol::OpenVpn => "[OV]",
@@ -648,10 +656,10 @@ pub fn render_details_pane<S: ConfigStorage, R: VpnRunner, P: Pinger>(
         lines.push(Line::from(vec![
             Span::styled("Name: ", theme.footer_key),
             Span::styled(&prof.name, theme.highlight),
-            Span::raw("   |   "),
+            Span::raw(" | "),
             Span::styled("Protocol: ", theme.footer_key),
             Span::styled(format!("{}", prof.protocol), theme.text),
-            Span::raw("   |   "),
+            Span::raw(" | "),
             Span::styled("Account: ", theme.footer_key),
             Span::styled(acc_name, theme.text),
         ]));
@@ -693,17 +701,79 @@ pub fn render_details_pane<S: ConfigStorage, R: VpnRunner, P: Pinger>(
             ]));
         }
 
-        if prof.flags.is_empty() {
+        if prof.protocol == crate::domain::config::VpnProtocol::OpenConnect
+            || prof.protocol == crate::domain::config::VpnProtocol::OpenVpn
+        {
+            let inherit_label = if prof.inherit_defaults {
+                "[x] ON"
+            } else {
+                "[ ] OFF"
+            };
+            let inherit_style = if prof.inherit_defaults {
+                theme.connected
+            } else {
+                theme.disconnected
+            };
+            let profile_flags_str = if prof.flags.is_empty() {
+                "(None)".to_string()
+            } else {
+                prof.flags.join(" ")
+            };
             lines.push(Line::from(vec![
-                Span::styled("Flags: ", theme.footer_key),
-                Span::styled("(No extra flags configured)", theme.footer_desc),
+                Span::styled("Inherit Defaults: ", theme.footer_key),
+                Span::styled(inherit_label, inherit_style),
+                Span::raw("   |   "),
+                Span::styled("Custom Flags: ", theme.footer_key),
+                Span::styled(profile_flags_str, theme.text),
             ]));
+
+            let default_flags_str = match prof.protocol {
+                crate::domain::config::VpnProtocol::OpenConnect => {
+                    app.defaults.openconnect_flags.join(" ")
+                }
+                crate::domain::config::VpnProtocol::OpenVpn => app.defaults.openvpn_flags.join(" "),
+                _ => String::new(),
+            };
+
+            if prof.inherit_defaults {
+                lines.push(Line::from(vec![
+                    Span::styled("Default Batch:    ", theme.footer_key),
+                    Span::styled(default_flags_str, theme.footer_desc),
+                ]));
+
+                let effective_args = match prof.protocol {
+                    crate::domain::config::VpnProtocol::OpenConnect => {
+                        crate::domain::flags::build_openconnect_args(
+                            prof,
+                            None,
+                            false,
+                            Some(&app.defaults),
+                        )
+                    }
+                    crate::domain::config::VpnProtocol::OpenVpn => {
+                        crate::domain::flags::build_openvpn_args(prof, None, Some(&app.defaults))
+                    }
+                    _ => Vec::new(),
+                };
+                let effective_str = effective_args.join(" ");
+                lines.push(Line::from(vec![
+                    Span::styled("Effective Args:   ", theme.footer_key),
+                    Span::styled(effective_str, theme.highlight),
+                ]));
+            }
         } else {
-            let flags_joined = prof.flags.join(" ");
-            lines.push(Line::from(vec![
-                Span::styled("Flags: ", theme.footer_key),
-                Span::styled(flags_joined, theme.text),
-            ]));
+            if prof.flags.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Flags: ", theme.footer_key),
+                    Span::styled("(No extra flags configured)", theme.footer_desc),
+                ]));
+            } else {
+                let flags_joined = prof.flags.join(" ");
+                lines.push(Line::from(vec![
+                    Span::styled("Flags: ", theme.footer_key),
+                    Span::styled(flags_joined, theme.text),
+                ]));
+            }
         }
 
         lines
@@ -810,22 +880,36 @@ fn render_footer(f: &mut Frame, active_pane: ActivePane, theme: &Theme, area: Re
         ActivePane::Profiles => vec![
             Span::styled(" [Enter]", theme.footer_key),
             Span::styled(" Connect ", theme.footer_desc),
-            Span::styled(" [Space]", theme.footer_key),
-            Span::styled(" Toggle ", theme.footer_desc),
-            Span::styled(" [m]", theme.footer_key),
+            Span::styled("[p]", theme.footer_key),
+            Span::styled(" Ping ", theme.footer_desc),
+            Span::styled("[P]", theme.footer_key),
+            Span::styled(" Ping All ", theme.footer_desc),
+            Span::styled("[m]", theme.footer_key),
             Span::styled(" Folder ", theme.footer_desc),
-            Span::styled(" [C]", theme.footer_key),
-            Span::styled(" Zoom ", theme.footer_desc),
-            Span::styled(" [d]", theme.footer_key),
-            Span::styled(" Disc ", theme.footer_desc),
-            Span::styled(" [A]", theme.footer_key),
-            Span::styled(" Accounts ", theme.footer_desc),
-            Span::styled(" [n]", theme.footer_key),
+            Span::styled("[n]", theme.footer_key),
             Span::styled(" New Config ", theme.footer_desc),
-            Span::styled(" [e]", theme.footer_key),
+            Span::styled("[e]", theme.footer_key),
             Span::styled(" Edit ", theme.footer_desc),
-            Span::styled(" [x]", theme.footer_key),
+            Span::styled("[x]", theme.footer_key),
             Span::styled(" Delete ", theme.footer_desc),
+            Span::styled("[d]", theme.footer_key),
+            Span::styled(" Disc ", theme.footer_desc),
+            Span::styled("[C]", theme.footer_key),
+            Span::styled(" Zoom ", theme.footer_desc),
+            Span::styled("[D]", theme.footer_key),
+            Span::styled(" Defaults ", theme.footer_desc),
+            Span::styled("[i]", theme.footer_key),
+            Span::styled(" Toggle ", theme.footer_desc),
+            Span::styled("[q]", theme.footer_key),
+            Span::styled(" Quit ", theme.footer_desc),
+        ],
+        ActivePane::Flags => vec![
+            Span::styled(" [Space/i]", theme.footer_key),
+            Span::styled(" Toggle Defaults ", theme.footer_desc),
+            Span::styled(" [D]", theme.footer_key),
+            Span::styled(" Edit Defaults ", theme.footer_desc),
+            Span::styled(" [Tab]", theme.footer_key),
+            Span::styled(" Switch Pane ", theme.footer_desc),
             Span::styled(" [q]", theme.footer_key),
             Span::styled(" Quit ", theme.footer_desc),
         ],
@@ -838,14 +922,6 @@ fn render_footer(f: &mut Frame, active_pane: ActivePane, theme: &Theme, area: Re
             Span::styled(" Top/Bottom ", theme.footer_desc),
             Span::styled(" [f]", theme.footer_key),
             Span::styled(" Zoom ", theme.footer_desc),
-            Span::styled(" [Tab]", theme.footer_key),
-            Span::styled(" Switch Pane ", theme.footer_desc),
-            Span::styled(" [q]", theme.footer_key),
-            Span::styled(" Quit ", theme.footer_desc),
-        ],
-        _ => vec![
-            Span::styled(" [f]", theme.footer_key),
-            Span::styled(" Zoom Logs ", theme.footer_desc),
             Span::styled(" [Tab]", theme.footer_key),
             Span::styled(" Switch Pane ", theme.footer_desc),
             Span::styled(" [q]", theme.footer_key),
@@ -955,6 +1031,8 @@ mod tests {
         let buffer_prof = format!("{:?}", terminal.backend().buffer());
         assert!(buffer_prof.contains("New Config"));
         assert!(buffer_prof.contains("Connect"));
+        assert!(buffer_prof.contains("Ping"));
+        assert!(buffer_prof.contains("Ping All"));
         assert!(buffer_prof.contains("Edit"));
         assert!(buffer_prof.contains("Delete"));
         assert!(buffer_prof.contains("Folder"));
@@ -1088,8 +1166,37 @@ mod tests {
         assert!(content.contains("Munich Hub"));
         assert!(content.contains("AlphaCorp"));
         assert!(content.contains("Europe/Germany"));
+        assert!(content.contains("Inherit Defaults:"));
+        assert!(content.contains("[x] ON"));
         assert!(content.contains("--no-dtls"));
+        assert!(content.contains("Effective Args:"));
         assert!(content.contains("Connection Logs"));
+    }
+
+    #[test]
+    fn test_render_details_pane_inheritance_states() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut storage = InMemoryStorage::new();
+        let prof = Profile::new_openvpn(
+            "Legacy VPN",
+            "legacy.vpn.net",
+            Some(std::path::PathBuf::from("/etc/openvpn/legacy.ovpn")),
+        )
+        .with_inherit_defaults(false);
+        storage.save_profile(&prof).unwrap();
+
+        let app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        terminal.draw(|f| render_ui(f, &app)).unwrap();
+
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("Legacy VPN"));
+        assert!(content.contains("Inherit Defaults:"));
+        assert!(content.contains("[ ] OFF"));
+        assert!(!content.contains("Default Batch:"));
+        assert!(!content.contains("Effective Args:"));
     }
 
     #[test]
@@ -1171,5 +1278,66 @@ mod tests {
         assert!(content.contains("V2Ray"));
         assert!(content.contains("Routing Mode:"));
         assert!(content.contains("TUN (Full VPN)"));
+    }
+
+    #[test]
+    fn test_render_folder_profiles_indentation() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut storage = InMemoryStorage::new();
+        let mut child_prof = Profile::new_openconnect("Work Node 01", "vpn.work.com:443");
+        child_prof.group = Some("Work".to_string());
+        storage.save_profile(&child_prof).unwrap();
+
+        let root_prof = Profile::new_openvpn("Direct Home", "home.vpn.com:1194", None);
+        storage.save_profile(&root_prof).unwrap();
+
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+        // Expand the "Work" folder so child profile is visible
+        app.expanded_folders.insert("Work".to_string());
+
+        terminal.draw(|f| render_ui(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered_lines = Vec::new();
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            rendered_lines.push(line);
+        }
+
+        // 1. Folder line: marker (2) + icon "▼ " (2) + name "Work" -> icon at col 3, name at col 5 inside border
+        let folder_line = rendered_lines
+            .iter()
+            .find(|l| l.contains("▼ Work"))
+            .expect("Folder line should be present");
+        assert!(folder_line.contains("▼ Work"));
+
+        // 2. Child profile line inside folder: marker (2) + 4 spaces indent + "[OC]" -> badge at col 7
+        // Notice 4 spaces of indent + 2 chars marker = 6 spaces before "[OC]"
+        let child_line = rendered_lines
+            .iter()
+            .find(|l| l.contains("[OC] Work Node 01"))
+            .expect("Child profile line should be present");
+        assert!(
+            child_line.contains("      [OC] Work Node 01")
+                || child_line.contains("▶     [OC] Work Node 01"),
+            "Child profile inside folder must have 4 spaces of depth indent (6 chars before badge): {}",
+            child_line
+        );
+
+        // 3. Root profile line: marker (2) + 0 spaces indent + "[OV]" -> badge at col 3
+        let root_line = rendered_lines
+            .iter()
+            .find(|l| l.contains("[OV] Direct Home"))
+            .expect("Root profile line should be present");
+        assert!(
+            root_line.contains("  [OV] Direct Home") || root_line.contains("▶ [OV] Direct Home"),
+            "Root profile must have no depth indent (2 chars before badge): {}",
+            root_line
+        );
     }
 }

@@ -1,5 +1,5 @@
 use crate::domain::account::{Account, AccountId};
-use crate::domain::config::{Profile, ProfileId, VpnProtocol};
+use crate::domain::config::{Profile, ProfileId, ProtocolDefaults, VpnProtocol};
 use crate::domain::subscription::Subscription;
 use crate::ports::storage::{BioVpnPortalsConfig, ConfigStorage};
 use anyhow::{Context, Result};
@@ -89,8 +89,15 @@ impl FsConfigStorage {
         self.root.join("biovpn_portals.toml")
     }
 
+    pub fn defaults_file(&self) -> PathBuf {
+        self.root.join("defaults.toml")
+    }
+
     pub fn is_managed_path(&self, path: &Path) -> bool {
-        let canonical_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
         let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         canonical_path.starts_with(&canonical_root)
     }
@@ -186,7 +193,9 @@ impl ConfigStorage for FsConfigStorage {
             for entry in &entries {
                 let path = entry.path();
                 if path.is_file() {
-                    if proto == VpnProtocol::OpenVpn && path.extension().is_some_and(|ext| ext == "ovpn") {
+                    if proto == VpnProtocol::OpenVpn
+                        && path.extension().is_some_and(|ext| ext == "ovpn")
+                    {
                         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                         let has_companion_toml = path.with_extension("toml").exists();
                         let already_loaded = profiles.iter().any(|p| {
@@ -203,7 +212,9 @@ impl ConfigStorage for FsConfigStorage {
                             );
                             profiles.push(profile);
                         }
-                    } else if proto == VpnProtocol::V2Ray && path.extension().is_some_and(|ext| ext == "json") {
+                    } else if proto == VpnProtocol::V2Ray
+                        && path.extension().is_some_and(|ext| ext == "json")
+                    {
                         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                         let has_companion_toml = path.with_extension("toml").exists();
                         let already_loaded = profiles.iter().any(|p| {
@@ -295,7 +306,8 @@ impl ConfigStorage for FsConfigStorage {
                                     .chars()
                                     .filter(|c| c.is_alphanumeric() || *c == '-')
                                     .collect::<String>();
-                                if stem == id.0 || slug == id.0 || stem.eq_ignore_ascii_case(&id.0) {
+                                if stem == id.0 || slug == id.0 || stem.eq_ignore_ascii_case(&id.0)
+                                {
                                     let _ = fs::remove_file(&path);
                                     removed = true;
                                 }
@@ -309,7 +321,8 @@ impl ConfigStorage for FsConfigStorage {
                                     .chars()
                                     .filter(|c| c.is_alphanumeric() || *c == '-')
                                     .collect::<String>();
-                                if stem == id.0 || slug == id.0 || stem.eq_ignore_ascii_case(&id.0) {
+                                if stem == id.0 || slug == id.0 || stem.eq_ignore_ascii_case(&id.0)
+                                {
                                     let _ = fs::remove_file(&path);
                                     removed = true;
                                 }
@@ -413,6 +426,26 @@ impl ConfigStorage for FsConfigStorage {
         self.ensure_dirs()?;
         let serialized = toml::to_string_pretty(config)?;
         fs::write(self.biovpn_portals_file(), serialized)?;
+        Ok(())
+    }
+
+    fn load_defaults(&self) -> Result<ProtocolDefaults> {
+        let file = self.defaults_file();
+        if !file.exists() {
+            return Ok(ProtocolDefaults::default());
+        }
+
+        let content = fs::read_to_string(&file)
+            .with_context(|| format!("Failed to read defaults file {:?}", file))?;
+        let defaults: ProtocolDefaults = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse defaults file {:?}", file))?;
+        Ok(defaults)
+    }
+
+    fn save_defaults(&mut self, defaults: &ProtocolDefaults) -> Result<()> {
+        self.ensure_dirs()?;
+        let serialized = toml::to_string_pretty(defaults)?;
+        fs::write(self.defaults_file(), serialized)?;
         Ok(())
     }
 }
@@ -558,7 +591,9 @@ mod tests {
 
         let sub1 = Subscription::new("Sub Alpha", "https://alpha.com/sub", "AlphaFolder");
         let sub2 = Subscription::new("Sub Beta", "https://beta.com/sub", "BetaFolder");
-        storage.save_subscriptions(&[sub1.clone(), sub2.clone()]).unwrap();
+        storage
+            .save_subscriptions(&[sub1.clone(), sub2.clone()])
+            .unwrap();
 
         assert!(storage.subscriptions_file().exists());
         let loaded = storage.load_subscriptions().unwrap();
@@ -630,6 +665,25 @@ mod tests {
     }
 
     #[test]
+    fn test_fs_storage_defaults_lifecycle() {
+        let tmp = tempdir().unwrap();
+        let mut storage = FsConfigStorage::with_root(tmp.path());
+
+        // Initial load without file returns defaults
+        let def = storage.load_defaults().unwrap();
+        assert_eq!(def, ProtocolDefaults::default());
+
+        // Save customized defaults
+        let mut custom = ProtocolDefaults::default();
+        custom.openconnect_flags.push("--test-flag".into());
+        storage.save_defaults(&custom).unwrap();
+
+        assert!(storage.defaults_file().exists());
+        let loaded = storage.load_defaults().unwrap();
+        assert_eq!(loaded, custom);
+    }
+
+    #[test]
     fn test_fs_storage_delete_biovpn_synced_profile_with_different_slug() {
         let tmp = tempdir().unwrap();
         let mut storage = FsConfigStorage::with_root(tmp.path());
@@ -690,7 +744,10 @@ mod tests {
         assert!(deleted);
 
         // External file MUST still exist!
-        assert!(external_ovpn.exists(), "External file outside managed root must be preserved");
+        assert!(
+            external_ovpn.exists(),
+            "External file outside managed root must be preserved"
+        );
 
         let reloaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();
         assert_eq!(reloaded.len(), 0);
@@ -716,7 +773,10 @@ mod tests {
         // Delete auto-detected profile
         let deleted = storage.delete_profile(&detected.id).unwrap();
         assert!(deleted);
-        assert!(!standalone_file.exists(), "Standalone .ovpn file must be deleted");
+        assert!(
+            !standalone_file.exists(),
+            "Standalone .ovpn file must be deleted"
+        );
 
         // Reload must find 0 profiles
         let reloaded = storage.load_profiles(Some(VpnProtocol::OpenVpn)).unwrap();

@@ -1,10 +1,10 @@
 use crate::domain::account::{Account, AccountId};
 use crate::domain::config::{
-    Profile, ProfileId, ProxyCore, ProxyRoutingMode, SslPolicy, VpnProtocol,
+    Profile, ProfileId, ProtocolDefaults, ProxyCore, ProxyRoutingMode, SslPolicy, VpnProtocol,
 };
-use crate::domain::state::{CertWarningState, ConnectionState, LatencyState};
+use crate::domain::state::{AppEvent, CertWarningState, ConnectionState, LatencyState};
 use crate::domain::subscription::{
-    current_timestamp_string, fetch_subscription_feed, parse_subscription_profiles, Subscription,
+    Subscription, current_timestamp_string, fetch_subscription_feed, parse_subscription_profiles,
 };
 use crate::infra::net_monitor::NetStats;
 use crate::ports::pinger::Pinger;
@@ -98,6 +98,7 @@ pub struct ConfigAdderState {
     pub v2_custom_flags: String,
     pub v2_save_as_subscription: bool,
 
+    pub inherit_defaults: bool,
     pub error_msg: Option<String>,
 }
 
@@ -142,6 +143,7 @@ impl ConfigAdderState {
             v2_custom_flags: String::new(),
             v2_save_as_subscription: true,
 
+            inherit_defaults: true,
             error_msg: None,
         }
     }
@@ -164,6 +166,7 @@ impl ConfigAdderState {
         state.editing_profile_id = Some(profile.id.clone());
         state.protocol = profile.protocol;
         state.ssl_policy = profile.ssl_policy;
+        state.inherit_defaults = profile.inherit_defaults;
         state.group = profile.group.clone().unwrap_or_default();
 
         if let Some(ref g) = profile.group {
@@ -255,8 +258,8 @@ impl ConfigAdderState {
 
     pub fn total_fields(&self) -> usize {
         match self.protocol {
-            VpnProtocol::OpenConnect => 11,
-            VpnProtocol::OpenVpn => 9,
+            VpnProtocol::OpenConnect => 12,
+            VpnProtocol::OpenVpn => 10,
             VpnProtocol::V2Ray => {
                 if self.v2_link.starts_with("http://") || self.v2_link.starts_with("https://") {
                     9
@@ -564,6 +567,25 @@ impl NewFolderModalState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultsModalState {
+    pub oc_flags: String,
+    pub ovpn_flags: String,
+    pub field_idx: usize,
+    pub error_msg: Option<String>,
+}
+
+impl DefaultsModalState {
+    pub fn new(defaults: &ProtocolDefaults) -> Self {
+        Self {
+            oc_flags: defaults.openconnect_flags.join(" "),
+            ovpn_flags: defaults.openvpn_flags.join(" "),
+            field_idx: 0,
+            error_msg: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveModal {
     None,
     SudoPassword {
@@ -573,6 +595,7 @@ pub enum ActiveModal {
     Account(AccountModalState),
     ConfigAdder(ConfigAdderState),
     NewFolder(NewFolderModalState),
+    Defaults(DefaultsModalState),
     FileBrowser {
         state: crate::ui::file_picker::FileBrowserState,
         parent_adder: ConfigAdderState,
@@ -608,6 +631,7 @@ pub struct App<S: ConfigStorage, R: VpnRunner, P: Pinger> {
 
     pub subscriptions: Vec<Subscription>,
     pub biovpn_portals: BioVpnPortalsConfig,
+    pub defaults: ProtocolDefaults,
 
     pub active_pane: ActivePane,
     pub active_modal: ActiveModal,
@@ -619,7 +643,10 @@ pub struct App<S: ConfigStorage, R: VpnRunner, P: Pinger> {
 
     pub event_tx: Option<mpsc::UnboundedSender<LogEvent>>,
     pub event_rx: Option<mpsc::UnboundedReceiver<LogEvent>>,
+    pub app_event_tx: mpsc::UnboundedSender<AppEvent>,
+    pub app_event_rx: mpsc::UnboundedReceiver<AppEvent>,
     pub should_quit: bool,
+    pub is_syncing: bool,
     pub logs_zoomed: bool,
     pub configs_zoomed: bool,
     pub accounts_expanded: bool,
@@ -641,6 +668,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         let custom_folders = storage.load_folders().unwrap_or_default();
         let subscriptions = storage.load_subscriptions().unwrap_or_default();
         let biovpn_portals = storage.load_biovpn_portals().unwrap_or_default();
+        let defaults = storage.load_defaults().unwrap_or_default();
 
         let mut expanded_folders = std::collections::HashSet::new();
         for p in &profiles {
@@ -672,6 +700,8 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
             }
         }
 
+        let (app_event_tx, app_event_rx) = mpsc::unbounded_channel();
+
         Self {
             storage,
             runner,
@@ -682,6 +712,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
             selected_profile_idx: 0,
             subscriptions,
             biovpn_portals,
+            defaults,
             active_pane: ActivePane::Profiles,
             active_modal: ActiveModal::None,
             connection_state: ConnectionState::Disconnected,
@@ -690,7 +721,10 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
             logs: Vec::new(),
             event_tx: None,
             event_rx: None,
+            app_event_tx,
+            app_event_rx,
             should_quit: false,
+            is_syncing: false,
             logs_zoomed: false,
             configs_zoomed: false,
             accounts_expanded: false,
@@ -715,6 +749,24 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         }
         for event in events {
             self.handle_log_event(event);
+        }
+
+        let mut app_events = Vec::new();
+        while let Ok(app_event) = self.app_event_rx.try_recv() {
+            app_events.push(app_event);
+        }
+        for app_event in app_events {
+            self.handle_app_event(app_event);
+        }
+    }
+
+    pub async fn wait_for_sync(&mut self) {
+        while self.is_syncing {
+            if let Some(ev) = self.app_event_rx.recv().await {
+                self.handle_app_event(ev);
+            } else {
+                break;
+            }
         }
     }
 
@@ -778,12 +830,8 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         }
         let sub = self.subscriptions[idx].clone();
         let body = fetch_subscription_feed(&sub.url).await?;
-        let profiles = parse_subscription_profiles(
-            &body,
-            &sub.folder,
-            sub.routing_mode,
-            sub.core_pref,
-        );
+        let profiles =
+            parse_subscription_profiles(&body, &sub.folder, sub.routing_mode, sub.core_pref);
         if profiles.is_empty() {
             anyhow::bail!("No valid proxy nodes found in subscription feed");
         }
@@ -878,6 +926,42 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
             return self.profiles.get(*profile_idx);
         }
         self.profiles.get(self.selected_profile_idx)
+    }
+
+    pub fn selected_profile_idx(&self) -> Option<usize> {
+        let tree = self.visible_tree();
+        if let Some(crate::ui::tree::VisibleTreeNode::Profile { profile_idx, .. }) =
+            tree.get(self.selected_tree_idx)
+        {
+            return Some(*profile_idx);
+        }
+        if self.selected_profile_idx < self.profiles.len() {
+            Some(self.selected_profile_idx)
+        } else {
+            None
+        }
+    }
+
+    pub fn toggle_selected_profile_inheritance(&mut self) -> Result<()> {
+        if let Some(idx) = self.selected_profile_idx() {
+            if let Some(prof) = self.profiles.get_mut(idx) {
+                if prof.protocol == VpnProtocol::OpenConnect || prof.protocol == VpnProtocol::OpenVpn {
+                    prof.inherit_defaults = !prof.inherit_defaults;
+                    let updated = prof.clone();
+                    self.storage.save_profile(&updated)?;
+                    let status = if updated.inherit_defaults {
+                        "[x] ON"
+                    } else {
+                        "[ ] OFF"
+                    };
+                    self.add_log(format!(
+                        "Profile '{}': default flags inheritance toggled to {}",
+                        updated.name, status
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn next_pane(&mut self) {
@@ -994,24 +1078,56 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         self.logs_auto_scroll = true;
     }
 
-    pub async fn ping_all(&mut self) {
+    pub fn ping_selected(&mut self) {
+        let tree = self.visible_tree();
+        let profile = if !tree.is_empty() {
+            match tree.get(self.selected_tree_idx) {
+                Some(crate::ui::tree::VisibleTreeNode::Profile { profile_idx, .. }) => {
+                    self.profiles.get(*profile_idx)
+                }
+                _ => None,
+            }
+        } else {
+            self.profiles.get(self.selected_profile_idx)
+        };
+
+        let (id, endpoint) = match profile {
+            Some(p) => (p.id.clone(), p.endpoint.clone()),
+            None => return,
+        };
+
+        if let Some(p) = self.profiles.iter_mut().find(|p| p.id == id) {
+            p.latency = LatencyState::Pinging;
+        }
+
+        let pinger = self.pinger.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let latency = pinger.ping(&endpoint, Duration::from_secs(2)).await;
+            let _ = tx.send(AppEvent::PingResult {
+                profile_id: id,
+                latency,
+            });
+        });
+    }
+
+    pub fn ping_all(&mut self) {
         for profile in &mut self.profiles {
             profile.latency = LatencyState::Pinging;
         }
 
-        let mut results = Vec::new();
         for profile in &self.profiles {
-            let latency = self
-                .pinger
-                .ping(&profile.endpoint, Duration::from_secs(2))
-                .await;
-            results.push((profile.id.clone(), latency));
-        }
-
-        for (id, latency) in results {
-            if let Some(p) = self.profiles.iter_mut().find(|p| p.id == id) {
-                p.latency = latency;
-            }
+            let id = profile.id.clone();
+            let endpoint = profile.endpoint.clone();
+            let pinger = self.pinger.clone();
+            let tx = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                let latency = pinger.ping(&endpoint, Duration::from_secs(2)).await;
+                let _ = tx.send(AppEvent::PingResult {
+                    profile_id: id,
+                    latency,
+                });
+            });
         }
     }
 
@@ -1134,6 +1250,53 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
         }
 
         Ok(())
+    }
+
+    pub fn handle_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::VpnLog(log) => self.handle_log_event(log),
+            AppEvent::PingResult {
+                profile_id,
+                latency,
+            } => {
+                if let Some(p) = self.profiles.iter_mut().find(|p| p.id == profile_id) {
+                    p.latency = latency;
+                }
+            }
+            AppEvent::SyncProgress(msg) => {
+                self.add_log(msg);
+            }
+            AppEvent::BioVpnSyncCompleted {
+                profiles,
+                folders,
+                summary_log,
+            } => {
+                self.is_syncing = false;
+                for prof in &profiles {
+                    let _ = self.storage.save_profile(prof);
+                }
+                for folder in folders {
+                    self.ensure_custom_folder(&folder);
+                    let mut path_accum = String::new();
+                    for part in folder.split('/') {
+                        if !path_accum.is_empty() {
+                            path_accum.push('/');
+                        }
+                        path_accum.push_str(part);
+                        self.expanded_folders.insert(path_accum.clone());
+                    }
+                }
+                self.reload_profiles();
+                self.expanded_folders.insert("BioVPN".to_string());
+                self.expanded_folders.insert("BioVPN/Cisco".to_string());
+                self.expanded_folders.insert("BioVPN/OpenVPN".to_string());
+                self.add_log(summary_log);
+            }
+            AppEvent::BioVpnSyncFailed(err) => {
+                self.is_syncing = false;
+                self.add_log(format!("[ERR] BioVPN sync failed: {}", err));
+            }
+        }
     }
 
     pub fn handle_log_event(&mut self, event: LogEvent) {
@@ -1369,14 +1532,17 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                 adder.ssl_policy = adder.ssl_policy.next();
                             }
                             8 => {
+                                adder.inherit_defaults = !adder.inherit_defaults;
+                            }
+                            9 => {
                                 adder.oc_no_dtls = !adder.oc_no_dtls;
                             }
                             2 => adder.oc_name.push(' '),
                             3 => adder.oc_endpoint.push(' '),
                             5 => adder.oc_authgroup.push(' '),
                             6 => adder.oc_servercert.push(' '),
-                            9 => adder.oc_custom_flags.push(' '),
-                            10 => {
+                            10 => adder.oc_custom_flags.push(' '),
+                            11 => {
                                 if adder.is_on_new_folder() {
                                     adder.custom_group_input.push(' ');
                                     adder.group.push(' ');
@@ -1396,16 +1562,19 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                     next_account_idx(adder.account_idx, self.accounts.len());
                             }
                             5 => {
-                                adder.ovpn_redirect_gateway = !adder.ovpn_redirect_gateway;
+                                adder.inherit_defaults = !adder.inherit_defaults;
                             }
                             6 => {
+                                adder.ovpn_redirect_gateway = !adder.ovpn_redirect_gateway;
+                            }
+                            7 => {
                                 adder.ovpn_dev_tun = !adder.ovpn_dev_tun;
                             }
                             2 => adder.ovpn_name.push(' '),
                             3 => adder.ovpn_path.push(' '),
                             4 => adder.ovpn_remote.push(' '),
-                            7 => adder.ovpn_custom_flags.push(' '),
-                            8 => {
+                            8 => adder.ovpn_custom_flags.push(' '),
+                            9 => {
                                 if adder.is_on_new_folder() {
                                     adder.custom_group_input.push(' ');
                                     adder.group.push(' ');
@@ -1474,9 +1643,12 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                 };
                             }
                             8 => {
+                                adder.inherit_defaults = !adder.inherit_defaults;
+                            }
+                            9 => {
                                 adder.oc_no_dtls = !adder.oc_no_dtls;
                             }
-                            10 => {
+                            11 => {
                                 adder.prev_folder_option();
                             }
                             _ => {}
@@ -1490,12 +1662,15 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                     prev_account_idx(adder.account_idx, self.accounts.len());
                             }
                             5 => {
-                                adder.ovpn_redirect_gateway = !adder.ovpn_redirect_gateway;
+                                adder.inherit_defaults = !adder.inherit_defaults;
                             }
                             6 => {
+                                adder.ovpn_redirect_gateway = !adder.ovpn_redirect_gateway;
+                            }
+                            7 => {
                                 adder.ovpn_dev_tun = !adder.ovpn_dev_tun;
                             }
-                            8 => {
+                            9 => {
                                 adder.prev_folder_option();
                             }
                             _ => {}
@@ -1543,9 +1718,12 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                 adder.ssl_policy = adder.ssl_policy.next();
                             }
                             8 => {
+                                adder.inherit_defaults = !adder.inherit_defaults;
+                            }
+                            9 => {
                                 adder.oc_no_dtls = !adder.oc_no_dtls;
                             }
-                            10 => {
+                            11 => {
                                 adder.next_folder_option();
                             }
                             _ => {}
@@ -1559,12 +1737,15 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                     next_account_idx(adder.account_idx, self.accounts.len());
                             }
                             5 => {
-                                adder.ovpn_redirect_gateway = !adder.ovpn_redirect_gateway;
+                                adder.inherit_defaults = !adder.inherit_defaults;
                             }
                             6 => {
+                                adder.ovpn_redirect_gateway = !adder.ovpn_redirect_gateway;
+                            }
+                            7 => {
                                 adder.ovpn_dev_tun = !adder.ovpn_dev_tun;
                             }
-                            8 => {
+                            9 => {
                                 adder.next_folder_option();
                             }
                             _ => {}
@@ -1609,10 +1790,10 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             6 => {
                                 adder.oc_servercert.pop();
                             }
-                            9 => {
+                            10 => {
                                 adder.oc_custom_flags.pop();
                             }
-                            10 => {
+                            11 => {
                                 if adder.is_on_new_folder() {
                                     adder.custom_group_input.pop();
                                     adder.group.pop();
@@ -1633,10 +1814,10 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             4 => {
                                 adder.ovpn_remote.pop();
                             }
-                            7 => {
+                            8 => {
                                 adder.ovpn_custom_flags.pop();
                             }
-                            8 => {
+                            9 => {
                                 if adder.is_on_new_folder() {
                                     adder.custom_group_input.pop();
                                     adder.group.pop();
@@ -1678,8 +1859,8 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             3 => adder.oc_endpoint.push(c),
                             5 => adder.oc_authgroup.push(c),
                             6 => adder.oc_servercert.push(c),
-                            9 => adder.oc_custom_flags.push(c),
-                            10 => {
+                            10 => adder.oc_custom_flags.push(c),
+                            11 => {
                                 if !adder.is_on_new_folder() {
                                     adder.folder_option_idx =
                                         adder.folder_options.len().saturating_sub(1);
@@ -1695,8 +1876,8 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             2 => adder.ovpn_name.push(c),
                             3 => adder.ovpn_path.push(c),
                             4 => adder.ovpn_remote.push(c),
-                            7 => adder.ovpn_custom_flags.push(c),
-                            8 => {
+                            8 => adder.ovpn_custom_flags.push(c),
+                            9 => {
                                 if !adder.is_on_new_folder() {
                                     adder.folder_option_idx =
                                         adder.folder_options.len().saturating_sub(1);
@@ -1782,6 +1963,71 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 }
                 _ => {
                     self.active_modal = ActiveModal::NewFolder(state);
+                }
+            },
+            ActiveModal::Defaults(mut state) => match code {
+                KeyCode::Esc => {
+                    self.active_modal = ActiveModal::None;
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    state.field_idx = (state.field_idx + 1) % 2;
+                    self.active_modal = ActiveModal::Defaults(state);
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    state.field_idx = if state.field_idx == 0 { 1 } else { 0 };
+                    self.active_modal = ActiveModal::Defaults(state);
+                }
+                KeyCode::Char(c) => {
+                    match state.field_idx {
+                        0 => state.oc_flags.push(c),
+                        1 => state.ovpn_flags.push(c),
+                        _ => {}
+                    }
+                    state.error_msg = None;
+                    self.active_modal = ActiveModal::Defaults(state);
+                }
+                KeyCode::Backspace => {
+                    match state.field_idx {
+                        0 => {
+                            state.oc_flags.pop();
+                        }
+                        1 => {
+                            state.ovpn_flags.pop();
+                        }
+                        _ => {}
+                    }
+                    state.error_msg = None;
+                    self.active_modal = ActiveModal::Defaults(state);
+                }
+                KeyCode::Enter => {
+                    let oc_flags: Vec<String> = state
+                        .oc_flags
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let ovpn_flags: Vec<String> = state
+                        .ovpn_flags
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+
+                    let new_defaults = ProtocolDefaults {
+                        openconnect_flags: oc_flags,
+                        openvpn_flags: ovpn_flags,
+                    };
+
+                    if let Err(e) = self.storage.save_defaults(&new_defaults) {
+                        state.error_msg = Some(format!("Failed to save defaults: {}", e));
+                        self.active_modal = ActiveModal::Defaults(state);
+                    } else {
+                        self.defaults = new_defaults.clone();
+                        self.runner.set_defaults(new_defaults);
+                        self.add_log("Protocol default flags updated and saved.");
+                        self.active_modal = ActiveModal::None;
+                    }
+                }
+                _ => {
+                    self.active_modal = ActiveModal::Defaults(state);
                 }
             },
             ActiveModal::FileBrowser {
@@ -2034,12 +2280,20 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 }
                 KeyCode::Enter => match state.selected_method_idx {
                     0 => {
+                        if self.is_syncing {
+                            self.add_log("[WARN] BioVPN sync is already running in background.");
+                            self.active_modal = ActiveModal::None;
+                            return Ok(());
+                        }
+
                         let (target_acc_id, creds) = match state.target_account_idx {
                             Some(idx) => match self.accounts.get(idx) {
                                 Some(acc) => {
                                     let creds = acc.credentials.as_ref();
-                                    let u = creds.and_then(|c| c.username.clone()).unwrap_or_default();
-                                    let p = creds.and_then(|c| c.password.clone()).unwrap_or_default();
+                                    let u =
+                                        creds.and_then(|c| c.username.clone()).unwrap_or_default();
+                                    let p =
+                                        creds.and_then(|c| c.password.clone()).unwrap_or_default();
                                     if u.trim().is_empty() || p.trim().is_empty() {
                                         state.error_message = Some(format!(
                                             "Account '{}' has empty username or password.",
@@ -2061,75 +2315,166 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                         };
 
                         let portal_url = state.selected_portal_url();
-                        let client =
-                            match crate::infra::biovpn_client::ReqwestBioVpnClient::new(Some(&portal_url)) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    state.error_message = Some(format!("HTTP client error: {}", e));
-                                    self.active_modal = ActiveModal::SyncManager(state);
-                                    return Ok(());
-                                }
-                            };
-
-                        use crate::ports::biovpn::BioVpnClient;
-                        let bundle_res = match creds {
-                            Some((username, password)) => {
-                                client.fetch_bundle(&username, &password).await
-                            }
-                            None => {
-                                client.fetch_direct_bundle().await
+                        let client = match crate::infra::biovpn_client::ReqwestBioVpnClient::new(
+                            Some(&portal_url),
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                state.error_message = Some(format!("HTTP client error: {}", e));
+                                self.active_modal = ActiveModal::SyncManager(state);
+                                return Ok(());
                             }
                         };
 
-                        match bundle_res {
-                            Ok(zip_bytes) => {
-                                let dest = {
-                                    let root = self.storage.get_config_root();
-                                    if root.starts_with("/mock") {
-                                        std::env::temp_dir().join("vpn_tui_test_openvpn")
-                                    } else {
-                                        root.join("openvpn")
-                                    }
-                                };
-                                let cursor = std::io::Cursor::new(zip_bytes);
-                                match crate::domain::importer::ProfileImporter::import_zip(
-                                    cursor,
-                                    &dest,
-                                    target_acc_id,
-                                    state.with_cisco,
-                                ) {
-                                    Ok(summary) => {
-                                        for prof in summary.profiles {
-                                            let _ = self.storage.save_profile(&prof);
+                        let dest = {
+                            let root = self.storage.get_config_root();
+                            if root.starts_with("/mock") {
+                                std::env::temp_dir().join("vpn_tui_test_openvpn")
+                            } else {
+                                root.join("openvpn")
+                            }
+                        };
+
+                        let tx = self.app_event_tx.clone();
+                        let with_cisco = state.with_cisco;
+
+                        self.active_modal = ActiveModal::None;
+                        self.is_syncing = true;
+                        self.add_log(format!(
+                            "[SYNC] Starting BioVPN sync from {}...",
+                            portal_url
+                        ));
+
+                        tokio::spawn(async move {
+                            let tx_logger = tx.clone();
+                            let client = client.with_logger(move |msg| {
+                                let _ = tx_logger.send(AppEvent::SyncProgress(msg));
+                            });
+
+                            use crate::ports::biovpn::BioVpnClient;
+                            let bundle_res = match creds {
+                                Some((username, password)) => {
+                                    client.fetch_bundle(&username, &password).await
+                                }
+                                None => client.fetch_direct_bundle().await,
+                            };
+
+                            let sync_data = match bundle_res {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BioVpnSyncFailed(e.to_string()));
+                                    return;
+                                }
+                            };
+
+                            for log_msg in sync_data.logs {
+                                let _ = tx.send(AppEvent::SyncProgress(log_msg));
+                            }
+
+                            let _ = std::fs::create_dir_all(&dest);
+
+                            let mut all_profiles = Vec::new();
+                            let mut all_folders = Vec::new();
+                            let mut html_cisco_count = 0;
+                            let mut imported_groups = Vec::new();
+
+                            if with_cisco {
+                                if let Some(ref html) = sync_data.dashboard_html {
+                                    if let Ok(parsed_html) =
+                                        crate::domain::importer::ProfileImporter::parse_portal_html(
+                                            html,
+                                            target_acc_id.clone(),
+                                            Some(&portal_url),
+                                        )
+                                    {
+                                        for prof in parsed_html.profiles {
+                                            if let Some(ref grp) = prof.group {
+                                                all_folders.push(grp.clone());
+                                            }
+                                            all_profiles.push(prof);
                                         }
-                                        if summary.openvpn_count > 0 {
-                                            self.ensure_custom_folder("BioVPN/OpenVPN");
-                                        }
-                                        if summary.openconnect_count > 0 {
-                                            self.ensure_custom_folder("BioVPN/Cisco");
-                                        }
-                                        self.reload_profiles();
-                                        self.expanded_folders.insert("BioVPN".to_string());
-                                        self.expanded_folders.insert("BioVPN/Cisco".to_string());
-                                        self.expanded_folders.insert("BioVPN/OpenVPN".to_string());
-                                        self.add_log(format!(
-                                            "BioVPN sync completed: imported {} OpenVPN and {} Cisco profiles.",
-                                            summary.openvpn_count, summary.openconnect_count
-                                        ));
-                                        self.active_modal = ActiveModal::None;
-                                    }
-                                    Err(e) => {
-                                        state.error_message =
-                                            Some(format!("Bundle extraction error: {}", e));
-                                        self.active_modal = ActiveModal::SyncManager(state);
+                                        html_cisco_count = all_profiles.len();
+                                        imported_groups = parsed_html.groups;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                state.error_message = Some(format!("Sync error: {}", e));
-                                self.active_modal = ActiveModal::SyncManager(state);
+
+                            let mut table_ovpn_count = 0;
+                            for item in sync_data.individual_ovpns {
+                                let target_file_path = dest.join(&item.filename);
+                                if let Err(e) = std::fs::write(&target_file_path, &item.content) {
+                                    let _ = tx.send(AppEvent::SyncProgress(format!(
+                                        "[WARN] Failed to save OpenVPN config {}: {}",
+                                        item.filename, e
+                                    )));
+                                    continue;
+                                }
+
+                                let ov_profile =
+                                    crate::domain::importer::ProfileImporter::create_table_openvpn_profile(
+                                        &item.server_name,
+                                        &item.country_group,
+                                        &item.content,
+                                        &target_file_path,
+                                        target_acc_id.clone(),
+                                    );
+
+                                if let Some(ref grp) = ov_profile.group {
+                                    all_folders.push(grp.clone());
+                                }
+                                all_profiles.push(ov_profile);
+                                table_ovpn_count += 1;
                             }
-                        }
+
+                            let cursor = std::io::Cursor::new(sync_data.zip_bytes);
+                            match crate::domain::importer::ProfileImporter::import_zip(
+                                cursor,
+                                &dest,
+                                target_acc_id,
+                                with_cisco,
+                            ) {
+                                Ok(summary) => {
+                                    if summary.openvpn_count > 0 || table_ovpn_count > 0 {
+                                        all_folders.push("BioVPN/OpenVPN".to_string());
+                                    }
+                                    if summary.openconnect_count > 0 || html_cisco_count > 0 {
+                                        all_folders.push("BioVPN/Cisco".to_string());
+                                    }
+                                    all_folders.push("BioVPN".to_string());
+
+                                    all_profiles.extend(summary.profiles);
+
+                                    let total_cisco = html_cisco_count + summary.openconnect_count;
+                                    let total_openvpn = summary.openvpn_count + table_ovpn_count;
+
+                                    let summary_log = if !imported_groups.is_empty() {
+                                        format!(
+                                            "BioVPN sync completed: imported {} OpenVPN and {} Cisco profiles across {} groups.",
+                                            total_openvpn,
+                                            total_cisco,
+                                            imported_groups.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "BioVPN sync completed: imported {} OpenVPN and {} Cisco profiles.",
+                                            total_openvpn, total_cisco
+                                        )
+                                    };
+
+                                    let _ = tx.send(AppEvent::BioVpnSyncCompleted {
+                                        profiles: all_profiles,
+                                        folders: all_folders,
+                                        summary_log,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BioVpnSyncFailed(format!(
+                                        "Bundle extraction error: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        });
                     }
                     1 => {
                         self.active_modal = ActiveModal::SyncFileBrowser {
@@ -2182,6 +2527,13 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             .extension()
                             .and_then(|e| e.to_str())
                             .map(|s| s.eq_ignore_ascii_case("zip"))
+                            .unwrap_or(false);
+                        let is_html = selected_file
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| {
+                                s.eq_ignore_ascii_case("html") || s.eq_ignore_ascii_case("htm")
+                            })
                             .unwrap_or(false);
                         if is_zip {
                             let target_acc = sync_state
@@ -2240,6 +2592,66 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                     self.active_modal = ActiveModal::SyncManager(sync);
                                 }
                             }
+                        } else if is_html {
+                            match std::fs::read_to_string(&selected_file) {
+                                Ok(html_content) => {
+                                    let target_acc = sync_state
+                                        .target_account_idx
+                                        .and_then(|idx| self.accounts.get(idx))
+                                        .map(|a| a.id.clone());
+                                    match crate::domain::importer::ProfileImporter::parse_portal_html(
+                                        &html_content,
+                                        target_acc,
+                                        None,
+                                    ) {
+                                        Ok(parsed) if !parsed.profiles.is_empty() => {
+                                            let count = parsed.profiles.len();
+                                            for prof in &parsed.profiles {
+                                                let _ = self.storage.save_profile(prof);
+                                                if let Some(ref grp) = prof.group {
+                                                    self.ensure_custom_folder(grp);
+                                                    let mut path_accum = String::new();
+                                                    for part in grp.split('/') {
+                                                        if !path_accum.is_empty() {
+                                                            path_accum.push('/');
+                                                        }
+                                                        path_accum.push_str(part);
+                                                        self.expanded_folders.insert(path_accum.clone());
+                                                    }
+                                                }
+                                            }
+                                            self.reload_profiles();
+                                            self.expanded_folders.insert("BioVPN".to_string());
+                                            self.expanded_folders.insert("BioVPN/Cisco".to_string());
+                                            self.add_log(format!(
+                                                "Imported {} Cisco profiles across {} groups from HTML.",
+                                                count, parsed.groups.len()
+                                            ));
+                                            self.active_modal = ActiveModal::None;
+                                        }
+                                        Ok(_) => {
+                                            let mut sync = sync_state;
+                                            sync.error_message = Some(
+                                                "No valid server profiles found in HTML file."
+                                                    .into(),
+                                            );
+                                            self.active_modal = ActiveModal::SyncManager(sync);
+                                        }
+                                        Err(e) => {
+                                            let mut sync = sync_state;
+                                            sync.error_message =
+                                                Some(format!("HTML parse error: {}", e));
+                                            self.active_modal = ActiveModal::SyncManager(sync);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let mut sync = sync_state;
+                                    sync.error_message =
+                                        Some(format!("Could not read HTML file: {}", e));
+                                    self.active_modal = ActiveModal::SyncManager(sync);
+                                }
+                            }
                         } else {
                             self.active_modal = ActiveModal::SyncFileBrowser { state, sync_state };
                         }
@@ -2287,8 +2699,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             .unwrap_or(0);
                         self.biovpn_portals = sync_state.to_portals_config();
                         let _ = self.storage.save_biovpn_portals(&self.biovpn_portals);
-                        sync_state.status_message =
-                            Some(format!("Added portal mirror: {}", norm));
+                        sync_state.status_message = Some(format!("Added portal mirror: {}", norm));
                         sync_state.error_message = None;
                         self.active_modal = ActiveModal::SyncManager(sync_state);
                     } else {
@@ -2335,8 +2746,19 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     ) {
                         Ok(profiles) if !profiles.is_empty() => {
                             let count = profiles.len();
-                            for prof in profiles {
-                                let _ = self.storage.save_profile(&prof);
+                            for prof in &profiles {
+                                let _ = self.storage.save_profile(prof);
+                                if let Some(ref grp) = prof.group {
+                                    self.ensure_custom_folder(grp);
+                                    let mut path_accum = String::new();
+                                    for part in grp.split('/') {
+                                        if !path_accum.is_empty() {
+                                            path_accum.push('/');
+                                        }
+                                        path_accum.push_str(part);
+                                        self.expanded_folders.insert(path_accum.clone());
+                                    }
+                                }
                             }
                             self.reload_profiles();
                             self.add_log(format!(
@@ -2384,7 +2806,9 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::SubscriptionManager(state);
                 }
                 KeyCode::Char('u') if !state.is_adding => {
-                    if !self.subscriptions.is_empty() && state.selected_idx < self.subscriptions.len() {
+                    if !self.subscriptions.is_empty()
+                        && state.selected_idx < self.subscriptions.len()
+                    {
                         match self.sync_subscription_by_idx(state.selected_idx).await {
                             Ok(count) => {
                                 state.subscriptions = self.subscriptions.clone();
@@ -2430,14 +2854,19 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.active_modal = ActiveModal::SubscriptionManager(state);
                 }
                 KeyCode::Char('d') if !state.is_adding => {
-                    if !self.subscriptions.is_empty() && state.selected_idx < self.subscriptions.len() {
+                    if !self.subscriptions.is_empty()
+                        && state.selected_idx < self.subscriptions.len()
+                    {
                         let removed = self.subscriptions.remove(state.selected_idx);
                         let _ = self.storage.save_subscriptions(&self.subscriptions);
                         state.subscriptions = self.subscriptions.clone();
-                        if state.selected_idx >= self.subscriptions.len() && !self.subscriptions.is_empty() {
+                        if state.selected_idx >= self.subscriptions.len()
+                            && !self.subscriptions.is_empty()
+                        {
                             state.selected_idx = self.subscriptions.len() - 1;
                         }
-                        state.status_message = Some(format!("Deleted subscription '{}'", removed.name));
+                        state.status_message =
+                            Some(format!("Deleted subscription '{}'", removed.name));
                         state.error_message = None;
                     }
                     self.active_modal = ActiveModal::SubscriptionManager(state);
@@ -2504,7 +2933,9 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                         state.add_folder.trim().to_string()
                     };
 
-                    if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                    if url.is_empty()
+                        || (!url.starts_with("http://") && !url.starts_with("https://"))
+                    {
                         state.error_message =
                             Some("Please enter a valid HTTP/HTTPS URL".to_string());
                         self.active_modal = ActiveModal::SubscriptionManager(state);
@@ -2564,7 +2995,9 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     }
                 }
                 KeyCode::Enter if !state.is_adding => {
-                    if !self.subscriptions.is_empty() && state.selected_idx < self.subscriptions.len() {
+                    if !self.subscriptions.is_empty()
+                        && state.selected_idx < self.subscriptions.len()
+                    {
                         match self.sync_subscription_by_idx(state.selected_idx).await {
                             Ok(count) => {
                                 state.subscriptions = self.subscriptions.clone();
@@ -2631,6 +3064,9 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                 ActiveModal::Account(AccountModalState::from_account(acc));
                         }
                     }
+                    ActivePane::Flags => {
+                        self.toggle_selected_profile_inheritance()?;
+                    }
                     _ => {}
                 },
                 KeyCode::Char(' ') => match self.active_pane {
@@ -2648,6 +3084,9 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                                 self.expanded_folders.insert(path.clone());
                             }
                         }
+                    }
+                    ActivePane::Flags => {
+                        self.toggle_selected_profile_inheritance()?;
                     }
                     _ => {}
                 },
@@ -2860,7 +3299,10 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     self.disconnect().await?;
                 }
                 KeyCode::Char('p') => {
-                    self.ping_all().await;
+                    self.ping_selected();
+                }
+                KeyCode::Char('P') => {
+                    self.ping_all();
                 }
                 KeyCode::Char('f') => {
                     self.logs_zoomed = !self.logs_zoomed;
@@ -3018,6 +3460,17 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 KeyCode::Char('m') | KeyCode::Char('M') => {
                     self.active_modal = ActiveModal::NewFolder(NewFolderModalState::new());
                 }
+                KeyCode::Char('D') => {
+                    if matches!(self.active_pane, ActivePane::Profiles | ActivePane::Flags) {
+                        self.active_modal =
+                            ActiveModal::Defaults(DefaultsModalState::new(&self.defaults));
+                    }
+                }
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    if matches!(self.active_pane, ActivePane::Profiles | ActivePane::Flags) {
+                        self.toggle_selected_profile_inheritance()?;
+                    }
+                }
                 _ => {}
             },
         }
@@ -3048,6 +3501,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 if let Some(id) = adder.editing_profile_id.clone() {
                     prof.id = id;
                 }
+                prof.inherit_defaults = adder.inherit_defaults;
                 prof.group = group_opt.clone();
 
                 let variant = OC_VARIANTS[adder.oc_variant_idx];
@@ -3115,6 +3569,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                             if let Some(id) = adder.editing_profile_id.clone() {
                                 prof.id = id;
                             }
+                            prof.inherit_defaults = adder.inherit_defaults;
                             prof.group = group_opt.clone();
                             if !adder.ovpn_remote.trim().is_empty() {
                                 prof.endpoint = adder.ovpn_remote.trim().to_string();
@@ -3165,6 +3620,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                     if let Some(id) = adder.editing_profile_id.clone() {
                         prof.id = id;
                     }
+                    prof.inherit_defaults = adder.inherit_defaults;
                     prof.group = group_opt.clone();
                     if adder.ovpn_redirect_gateway {
                         prof = prof.with_flag("--redirect-gateway").with_flag("def1");
@@ -3346,6 +3802,7 @@ impl<S: ConfigStorage, R: VpnRunner, P: Pinger> App<S, R, P> {
                 if let Some(id) = adder.editing_profile_id.clone() {
                     prof.id = id;
                 }
+                prof.inherit_defaults = adder.inherit_defaults;
                 prof.group = group_opt.clone();
                 if let Some(endpoint) = proxy_endpoint {
                     prof.proxy_endpoint = Some(endpoint);
@@ -3415,6 +3872,36 @@ mod tests {
         assert_eq!(app.active_pane, ActivePane::Profiles);
     }
 
+    #[test]
+    fn test_app_event_channel_initialization_and_handle_app_event() {
+        let mut app = setup_app();
+        let pid = app.profiles[0].id.clone();
+        assert_eq!(app.profiles[0].latency, LatencyState::Unknown);
+
+        // PingResult updates profile latency
+        app.handle_app_event(AppEvent::PingResult {
+            profile_id: pid.clone(),
+            latency: LatencyState::Measured(42),
+        });
+        assert_eq!(app.profiles[0].latency, LatencyState::Measured(42));
+
+        // VpnLog appends to logs
+        app.handle_app_event(AppEvent::VpnLog(LogEvent::Stdout(
+            "test app event log".into(),
+        )));
+        assert!(app.logs.iter().any(|l| l.contains("test app event log")));
+
+        // Channel sending + poll_log_events
+        app.app_event_tx
+            .send(AppEvent::PingResult {
+                profile_id: pid,
+                latency: LatencyState::Measured(99),
+            })
+            .unwrap();
+        app.poll_log_events();
+        assert_eq!(app.profiles[0].latency, LatencyState::Measured(99));
+    }
+
     #[tokio::test]
     async fn test_app_connect_and_disconnect() {
         let mut app = setup_app();
@@ -3453,7 +3940,66 @@ mod tests {
         let mut app = setup_app();
         assert_eq!(app.profiles[0].latency, LatencyState::Unknown);
 
-        app.ping_all().await;
+        app.ping_all();
+        assert_eq!(app.profiles[0].latency, LatencyState::Pinging);
+
+        let ev = app.app_event_rx.recv().await.unwrap();
+        app.handle_app_event(ev);
+        assert_eq!(app.profiles[0].latency, LatencyState::Measured(25));
+    }
+
+    #[tokio::test]
+    async fn test_app_ping_selected() {
+        let mut app = setup_app();
+        let prof2 = Profile::new_openconnect("London", "vpn.london.com:443");
+        app.storage.save_profile(&prof2).unwrap();
+        app.profiles.push(prof2);
+
+        assert_eq!(app.profiles[0].latency, LatencyState::Unknown);
+        assert_eq!(app.profiles[1].latency, LatencyState::Unknown);
+
+        app.select_profile_by_idx(0);
+        app.ping_selected();
+
+        assert_eq!(app.profiles[0].latency, LatencyState::Pinging);
+        assert_eq!(app.profiles[1].latency, LatencyState::Unknown);
+
+        let ev = app.app_event_rx.recv().await.unwrap();
+        app.handle_app_event(ev);
+        assert_eq!(app.profiles[0].latency, LatencyState::Measured(25));
+        assert_eq!(app.profiles[1].latency, LatencyState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn test_app_ping_selected_folder_noop() {
+        let mut app = setup_app();
+        app.profiles[0].group = Some("Work/Servers".to_string());
+        app.expanded_folders.insert("Work".to_string());
+        app.sync_tree_selection();
+        app.selected_tree_idx = 0; // Folder node
+        app.ping_selected();
+
+        assert_eq!(app.profiles[0].latency, LatencyState::Unknown);
+        assert!(app.app_event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_app_ping_keybindings() {
+        let mut app = setup_app();
+        assert_eq!(app.profiles[0].latency, LatencyState::Unknown);
+
+        app.handle_key(KeyCode::Char('p')).await.unwrap();
+        assert_eq!(app.profiles[0].latency, LatencyState::Pinging);
+        let ev = app.app_event_rx.recv().await.unwrap();
+        app.handle_app_event(ev);
+        assert_eq!(app.profiles[0].latency, LatencyState::Measured(25));
+
+        app.profiles[0].latency = LatencyState::Unknown;
+
+        app.handle_key(KeyCode::Char('P')).await.unwrap();
+        assert_eq!(app.profiles[0].latency, LatencyState::Pinging);
+        let ev = app.app_event_rx.recv().await.unwrap();
+        app.handle_app_event(ev);
         assert_eq!(app.profiles[0].latency, LatencyState::Measured(25));
     }
 
@@ -3607,6 +4153,135 @@ mod tests {
     }
 
     #[tokio::test]
+    pub async fn test_app_config_adder_inherit_defaults_toggle() {
+        let mut app = setup_app();
+        app.handle_key(KeyCode::Char('n')).await.unwrap();
+
+        // Navigate to field 8 (Inherit Defaults for OpenConnect)
+        for _ in 0..8 {
+            app.handle_key(KeyCode::Tab).await.unwrap();
+        }
+
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert_eq!(adder.field_idx, 8);
+        assert!(adder.inherit_defaults);
+
+        // Toggle with space -> false
+        app.handle_key(KeyCode::Char(' ')).await.unwrap();
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert!(!adder.inherit_defaults);
+
+        // Toggle with space -> true
+        app.handle_key(KeyCode::Char(' ')).await.unwrap();
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert!(adder.inherit_defaults);
+    }
+
+    #[tokio::test]
+    pub async fn test_app_config_adder_custom_flags_and_checkboxes() {
+        use crossterm::event::KeyCode;
+
+        let mut app = setup_app();
+        app.handle_key(KeyCode::Char('n')).await.unwrap();
+
+        // 1. OpenConnect: navigate to field 8 (Inherit Defaults)
+        for _ in 0..8 {
+            app.handle_key(KeyCode::Tab).await.unwrap();
+        }
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert_eq!(adder.field_idx, 8);
+        assert!(adder.inherit_defaults);
+
+        // Toggle with Space: true -> false
+        app.handle_key(KeyCode::Char(' ')).await.unwrap();
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert!(!adder.inherit_defaults);
+
+        // 2. Tab to field 9 (No-DTLS)
+        app.handle_key(KeyCode::Tab).await.unwrap();
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert_eq!(adder.field_idx, 9);
+        assert!(!adder.oc_no_dtls);
+
+        // Toggle with Space
+        app.handle_key(KeyCode::Char(' ')).await.unwrap();
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert!(adder.oc_no_dtls);
+
+        // 3. Tab to field 10 (Custom Flags)
+        app.handle_key(KeyCode::Tab).await.unwrap();
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert_eq!(adder.field_idx, 10);
+        assert!(adder.oc_custom_flags.is_empty());
+
+        // Type "--pfs --mtu=1400"
+        for c in "--pfs --mtu=1400".chars() {
+            app.handle_key(KeyCode::Char(c)).await.unwrap();
+        }
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert_eq!(adder.oc_custom_flags, "--pfs --mtu=1400");
+
+        // Backspace twice to test backspace on custom flags
+        app.handle_key(KeyCode::Backspace).await.unwrap();
+        app.handle_key(KeyCode::Backspace).await.unwrap();
+        let adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert_eq!(adder.oc_custom_flags, "--pfs --mtu=14");
+
+        // Finish typing and submit
+        for c in "00".chars() {
+            app.handle_key(KeyCode::Char(c)).await.unwrap();
+        }
+        let mut adder = match &app.active_modal {
+            ActiveModal::ConfigAdder(a) => a.clone(),
+            other => panic!("Expected ConfigAdder, got {:?}", other),
+        };
+        assert_eq!(adder.oc_custom_flags, "--pfs --mtu=1400");
+        adder.oc_name = "OC Flags Test".into();
+        adder.oc_endpoint = "oc.flags.corp:443".into();
+        app.submit_config_adder(adder).await.unwrap();
+
+        let prof = app
+            .profiles
+            .iter()
+            .find(|p| p.name == "OC Flags Test")
+            .unwrap();
+        assert!(!prof.inherit_defaults);
+        assert!(prof.flags.contains(&"--no-dtls".to_string()));
+        assert!(prof.flags.contains(&"--pfs".to_string()));
+        assert!(prof.flags.contains(&"--mtu=1400".to_string()));
+    }
+
+    #[tokio::test]
     pub async fn test_app_config_submit_openvpn() {
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -3654,7 +4329,12 @@ mod tests {
         match &app.active_modal {
             ActiveModal::ConfigAdder(st) => {
                 assert!(st.error_msg.is_some());
-                assert!(st.error_msg.as_ref().unwrap().contains("Invalid share link"));
+                assert!(
+                    st.error_msg
+                        .as_ref()
+                        .unwrap()
+                        .contains("Invalid share link")
+                );
             }
             other => panic!("Expected ConfigAdder modal with error, got {:?}", other),
         }
@@ -4227,12 +4907,12 @@ mod tests {
             _ => panic!("Expected ConfigAdder modal"),
         };
 
-        // OpenConnect total_fields = 11
-        assert_eq!(adder.total_fields(), 11);
+        // OpenConnect total_fields = 12
+        assert_eq!(adder.total_fields(), 12);
 
         adder.oc_name = "Production US".to_string();
         adder.oc_endpoint = "vpn.us.corp:443".to_string();
-        adder.field_idx = 10; // Group field
+        adder.field_idx = 11; // Group field
 
         app.active_modal = ActiveModal::ConfigAdder(adder);
 
@@ -4318,14 +4998,14 @@ mod tests {
         assert_eq!(adder.folder_options.len(), 4);
         assert_eq!(adder.folder_option_idx, 0); // initially (None / Root)
 
-        // Set field_idx to 10 (Folder field)
+        // Set field_idx to 11 (Folder field)
         let mut adder = adder;
         adder.oc_name = "Frankfurt Gateway".to_string();
         adder.oc_endpoint = "1.2.3.4:443".to_string();
-        adder.field_idx = 10;
+        adder.field_idx = 11;
         app.active_modal = ActiveModal::ConfigAdder(adder);
 
-        // Press Space on field 10 -> Cycles to index 1: "BioVPN/Cisco"
+        // Press Space on field 11 -> Cycles to index 1: "BioVPN/Cisco"
         app.handle_key(KeyCode::Char(' ')).await.unwrap();
         let adder = match &app.active_modal {
             ActiveModal::ConfigAdder(a) => a.clone(),
@@ -4334,7 +5014,7 @@ mod tests {
         assert_eq!(adder.folder_option_idx, 1);
         assert_eq!(adder.selected_folder_display(), "BioVPN/Cisco");
 
-        // Press Right on field 10 -> Cycles to index 2: "Work/Europe"
+        // Press Right on field 11 -> Cycles to index 2: "Work/Europe"
         app.handle_key(KeyCode::Right).await.unwrap();
         let adder = match &app.active_modal {
             ActiveModal::ConfigAdder(a) => a.clone(),
@@ -4698,7 +5378,12 @@ mod tests {
         app.handle_key(KeyCode::Char('d')).await.unwrap();
         if let ActiveModal::SubscriptionManager(st) = &app.active_modal {
             assert_eq!(st.subscriptions.len(), 0);
-            assert!(st.status_message.as_ref().unwrap().contains("Deleted subscription"));
+            assert!(
+                st.status_message
+                    .as_ref()
+                    .unwrap()
+                    .contains("Deleted subscription")
+            );
         }
 
         // Press Esc to exit back to SyncManager
@@ -4799,7 +5484,10 @@ mod tests {
 
         // Press 'a' to open AddBioVpnPortal modal
         app.handle_key(KeyCode::Char('a')).await.unwrap();
-        assert!(matches!(app.active_modal, ActiveModal::AddBioVpnPortal { .. }));
+        assert!(matches!(
+            app.active_modal,
+            ActiveModal::AddBioVpnPortal { .. }
+        ));
 
         // Type "mirror.org/vpn/"
         for c in "mirror.org/vpn/".chars() {
@@ -4813,7 +5501,12 @@ mod tests {
         if let ActiveModal::SyncManager(st) = &app.active_modal {
             assert_eq!(st.selected_portal_url(), "https://mirror.org/vpn");
             assert_eq!(st.portal_urls.len(), 3);
-            assert!(st.status_message.as_ref().unwrap().contains("Added portal mirror"));
+            assert!(
+                st.status_message
+                    .as_ref()
+                    .unwrap()
+                    .contains("Added portal mirror")
+            );
         } else {
             panic!("Expected SyncManager modal after adding portal");
         }
@@ -4886,7 +5579,8 @@ mod tests {
                     .compression_method(zip::CompressionMethod::Stored);
                 zip.start_file("Frankfurt-SmartTCP.ovpn", options).unwrap();
                 use std::io::Write;
-                zip.write_all(b"remote 192.168.1.1 1194\nproto udp\n").unwrap();
+                zip.write_all(b"remote 192.168.1.1 1194\nproto udp\n")
+                    .unwrap();
                 zip.finish().unwrap();
             }
             buf
@@ -4919,12 +5613,17 @@ mod tests {
 
         app.active_modal = ActiveModal::SyncManager(sync_state);
         app.handle_key(KeyCode::Enter).await.unwrap();
+        app.wait_for_sync().await;
 
         assert_eq!(app.active_modal, ActiveModal::None);
         assert_eq!(app.profiles.len(), 2); // 1 OpenVPN + 1 Cisco
         assert_eq!(app.profiles[0].account_id, None);
         assert_eq!(app.profiles[1].account_id, None);
-        assert!(app.logs.iter().any(|l| l.contains("imported 1 OpenVPN and 1 Cisco")));
+        assert!(
+            app.logs
+                .iter()
+                .any(|l| l.contains("imported 1 OpenVPN and 1 Cisco"))
+        );
     }
 
     #[tokio::test]
@@ -4954,6 +5653,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sync_manager_batch_import_html_with_subfolders() {
+        let storage = InMemoryStorage::new();
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        let mut sync_state = SyncManagerState::new();
+        sync_state.selected_method_idx = 2; // Batch server import
+        sync_state.target_account_idx = None;
+
+        app.active_modal = ActiveModal::SyncManager(sync_state);
+        app.handle_key(KeyCode::Enter).await.unwrap();
+
+        let html_input = r#"
+            <table class="table">
+                <tr class="bio-server-group-toggle"><th>آلمان</th></tr>
+                <tr class="bio-server-child-row">
+                    <th>Berlin-Cisco</th>
+                    <td><span class="server-address">de1.biovpn.net:443</span></td>
+                </tr>
+            </table>
+        "#;
+
+        for c in html_input.chars() {
+            app.handle_key(KeyCode::Char(c)).await.unwrap();
+        }
+        app.handle_key(KeyCode::Enter).await.unwrap();
+
+        assert_eq!(app.active_modal, ActiveModal::None);
+        assert_eq!(app.profiles.len(), 1);
+        assert_eq!(app.profiles[0].name, "Berlin-Cisco (de1) (Cisco)");
+        assert_eq!(
+            app.profiles[0].group.as_deref(),
+            Some("BioVPN/Cisco/Germany")
+        );
+        assert!(
+            app.custom_folders
+                .contains(&"BioVPN/Cisco/Germany".to_string())
+        );
+        assert!(app.expanded_folders.contains("BioVPN/Cisco/Germany"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_file_browser_html_import() {
+        let storage = InMemoryStorage::new();
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let html_file_path = temp_dir.path().join("dashboard.html");
+        let html_content = r#"
+            <div id="accordion-tab-regular-2">
+                <tr class="bio-server-group-toggle"><th>هلند</th></tr>
+                <tr class="bio-server-child-row">
+                    <th>Amsterdam-01</th>
+                    <td><span class="server-address">nl.cdntak.com</span></td>
+                </tr>
+            </div>
+        "#;
+        std::fs::write(&html_file_path, html_content).unwrap();
+
+        let sync_state = SyncManagerState::new();
+        let mut browser_state =
+            crate::ui::file_picker::FileBrowserState::new(Some(temp_dir.path().to_path_buf()));
+        // Select the html file
+        let idx = browser_state
+            .entries
+            .iter()
+            .position(|e| e.name == "dashboard.html")
+            .unwrap();
+        browser_state.selected_index = idx;
+
+        app.active_modal = ActiveModal::SyncFileBrowser {
+            state: browser_state,
+            sync_state,
+        };
+
+        app.handle_key(KeyCode::Enter).await.unwrap();
+
+        assert_eq!(app.active_modal, ActiveModal::None);
+        assert_eq!(app.profiles.len(), 1);
+        assert_eq!(app.profiles[0].name, "Amsterdam-01 (nl) (Cisco)");
+        assert_eq!(app.profiles[0].endpoint, "nl.cdntak.com:443");
+        assert_eq!(
+            app.profiles[0].group.as_deref(),
+            Some("BioVPN/Cisco/Netherlands")
+        );
+        assert!(
+            app.custom_folders
+                .contains(&"BioVPN/Cisco/Netherlands".to_string())
+        );
+        assert!(
+            app.logs
+                .iter()
+                .any(|l| l.contains("Imported 1 Cisco profiles"))
+        );
+    }
+
+    #[tokio::test]
     async fn test_app_delete_openvpn_profile_fs_storage_integration() {
         use crate::infra::fs_storage::FsConfigStorage;
         let tmp = tempfile::tempdir().unwrap();
@@ -4972,7 +5767,10 @@ mod tests {
         // Delete profile via 'x' and 'y'
         app.active_pane = ActivePane::Profiles;
         app.handle_key(KeyCode::Char('x')).await.unwrap();
-        assert!(matches!(app.active_modal, ActiveModal::ConfirmDelete { .. }));
+        assert!(matches!(
+            app.active_modal,
+            ActiveModal::ConfirmDelete { .. }
+        ));
 
         app.handle_key(KeyCode::Char('y')).await.unwrap();
         assert_eq!(app.active_modal, ActiveModal::None);
@@ -5015,7 +5813,9 @@ mod tests {
         let p3 = Profile::new_openvpn("standalone", "3.3.3.3:1194", Some(f3.clone()));
         storage.save_profile(&p3).unwrap();
 
-        storage.save_folders(&["BioVPN".to_string(), "BioVPN/OpenVPN".to_string()]).unwrap();
+        storage
+            .save_folders(&["BioVPN".to_string(), "BioVPN/OpenVPN".to_string()])
+            .unwrap();
 
         let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
         app.expanded_folders.insert("BioVPN".to_string());
@@ -5058,6 +5858,140 @@ mod tests {
         app.reload_profiles();
         assert_eq!(app.profiles.len(), 1);
         assert_eq!(app.profiles[0].name, "standalone");
+    }
+
+    #[tokio::test]
+    async fn test_defaults_modal_lifecycle_and_keybindings() {
+        use crossterm::event::KeyCode;
+
+        let storage = InMemoryStorage::new();
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+
+        // 1. Initial defaults match ProtocolDefaults::default()
+        assert_eq!(app.defaults, ProtocolDefaults::default());
+
+        // 2. Cannot open Defaults modal from Accounts pane
+        app.active_pane = ActivePane::Accounts;
+        app.handle_key(KeyCode::Char('D')).await.unwrap();
+        assert_eq!(app.active_modal, ActiveModal::None);
+
+        // 3. Open Defaults modal from Profiles pane via 'D'
+        app.active_pane = ActivePane::Profiles;
+        app.handle_key(KeyCode::Char('D')).await.unwrap();
+        match &app.active_modal {
+            ActiveModal::Defaults(st) => {
+                assert_eq!(st.field_idx, 0);
+                assert_eq!(st.oc_flags, "--protocol=anyconnect --no-dtls --pfs");
+                assert_eq!(st.ovpn_flags, "--dev tun --redirect-gateway def1");
+            }
+            other => panic!("Expected Defaults modal, got {:?}", other),
+        }
+
+        // 4. Cancel with Esc
+        app.handle_key(KeyCode::Esc).await.unwrap();
+        assert_eq!(app.active_modal, ActiveModal::None);
+
+        // 5. Open Defaults modal from Flags pane via 'D'
+        app.active_pane = ActivePane::Flags;
+        app.handle_key(KeyCode::Char('D')).await.unwrap();
+        assert!(matches!(app.active_modal, ActiveModal::Defaults(_)));
+
+        // 6. Navigation between fields: Tab and BackTab
+        app.handle_key(KeyCode::Tab).await.unwrap();
+        if let ActiveModal::Defaults(st) = &app.active_modal {
+            assert_eq!(st.field_idx, 1);
+        } else {
+            panic!("Expected Defaults modal");
+        }
+
+        app.handle_key(KeyCode::BackTab).await.unwrap();
+        if let ActiveModal::Defaults(st) = &app.active_modal {
+            assert_eq!(st.field_idx, 0);
+        } else {
+            panic!("Expected Defaults modal");
+        }
+
+        // 7. Edit field 0 (OpenConnect flags): type extra flag
+        for c in " --compression=lz4".chars() {
+            app.handle_key(KeyCode::Char(c)).await.unwrap();
+        }
+        if let ActiveModal::Defaults(st) = &app.active_modal {
+            assert_eq!(
+                st.oc_flags,
+                "--protocol=anyconnect --no-dtls --pfs --compression=lz4"
+            );
+        }
+
+        // 8. Switch to field 1 (OpenVPN flags) and edit
+        app.handle_key(KeyCode::Tab).await.unwrap();
+        // Backspace to remove "def1"
+        for _ in 0..4 {
+            app.handle_key(KeyCode::Backspace).await.unwrap();
+        }
+        for c in "bypass-dhcp".chars() {
+            app.handle_key(KeyCode::Char(c)).await.unwrap();
+        }
+        if let ActiveModal::Defaults(st) = &app.active_modal {
+            assert_eq!(st.ovpn_flags, "--dev tun --redirect-gateway bypass-dhcp");
+        }
+
+        // 9. Submit with Enter: persists to storage, updates app.defaults, closes modal
+        app.handle_key(KeyCode::Enter).await.unwrap();
+        assert_eq!(app.active_modal, ActiveModal::None);
+
+        assert_eq!(
+            app.defaults.openconnect_flags,
+            vec![
+                "--protocol=anyconnect",
+                "--no-dtls",
+                "--pfs",
+                "--compression=lz4"
+            ]
+        );
+        assert_eq!(
+            app.defaults.openvpn_flags,
+            vec!["--dev", "tun", "--redirect-gateway", "bypass-dhcp"]
+        );
+
+        // Verify storage persisted defaults
+        let loaded = app.storage.load_defaults().unwrap();
+        assert_eq!(loaded, app.defaults);
+    }
+
+    #[tokio::test]
+    async fn test_toggle_selected_profile_inheritance_hotkeys() {
+        use crossterm::event::KeyCode;
+
+        let mut storage = InMemoryStorage::new();
+        let prof = Profile::new_openconnect("Test Gateway", "vpn.test:443")
+            .with_inherit_defaults(true);
+        storage.save_profile(&prof).unwrap();
+
+        let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+        assert_eq!(app.profiles.len(), 1);
+        assert!(app.profiles[0].inherit_defaults);
+
+        // 1. From Profiles pane: press 'i' to toggle inheritance off
+        app.active_pane = ActivePane::Profiles;
+        app.handle_key(KeyCode::Char('i')).await.unwrap();
+        assert!(!app.profiles[0].inherit_defaults);
+
+        // Verify storage persisted updated profile
+        let loaded = app.storage.load_profiles(None).unwrap();
+        assert!(!loaded[0].inherit_defaults);
+
+        // 2. From Profiles pane: press 'I' to toggle inheritance back on
+        app.handle_key(KeyCode::Char('I')).await.unwrap();
+        assert!(app.profiles[0].inherit_defaults);
+
+        // 3. Switch to Flags pane: press Space to toggle off
+        app.active_pane = ActivePane::Flags;
+        app.handle_key(KeyCode::Char(' ')).await.unwrap();
+        assert!(!app.profiles[0].inherit_defaults);
+
+        // 4. From Flags pane: press Enter to toggle back on
+        app.handle_key(KeyCode::Enter).await.unwrap();
+        assert!(app.profiles[0].inherit_defaults);
     }
 }
 

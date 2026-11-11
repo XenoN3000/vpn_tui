@@ -1,5 +1,5 @@
 use super::config::{ProxyEndpoint, ProxyType};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::Deserialize;
 
@@ -294,7 +294,9 @@ pub fn parse_share_link(link: &str) -> Result<(ProxyEndpoint, Option<String>)> {
     } else if trimmed.starts_with("ss://") {
         parse_shadowsocks(trimmed)
     } else {
-        bail!("Unsupported share link scheme: must begin with vmess://, vless://, trojan://, or ss://")
+        bail!(
+            "Unsupported share link scheme: must begin with vmess://, vless://, trojan://, or ss://"
+        )
     }
 }
 
@@ -345,7 +347,8 @@ mod tests {
 
     #[test]
     fn test_parse_trojan_valid() {
-        let link = "trojan://secretpass123@tr.node.io:443?security=tls&sni=tr.node.io#Tokyo%20Trojan";
+        let link =
+            "trojan://secretpass123@tr.node.io:443?security=tls&sni=tr.node.io#Tokyo%20Trojan";
         let (ep, name) = parse_share_link(link).unwrap();
 
         assert_eq!(name.as_deref(), Some("Tokyo Trojan"));

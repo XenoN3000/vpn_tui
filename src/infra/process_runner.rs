@@ -1,5 +1,7 @@
 use crate::domain::account::Credentials;
-use crate::domain::config::{Profile, ProxyCore, ProxyRoutingMode, SslPolicy, VpnProtocol};
+use crate::domain::config::{
+    Profile, ProtocolDefaults, ProxyCore, ProxyRoutingMode, SslPolicy, VpnProtocol,
+};
 use crate::domain::flags::{build_openconnect_args, build_openvpn_args};
 use crate::ports::vpn_runner::{CertProbeResult, LogEvent, VpnRunner};
 use anyhow::{Context, Result};
@@ -110,19 +112,34 @@ pub fn set_desktop_proxy(http_port: u16, socks_port: u16) -> Result<()> {
             .args(["set", "org.gnome.system.proxy.http", "host", "127.0.0.1"])
             .status();
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy.http", "port", &http_port.to_string()])
+            .args([
+                "set",
+                "org.gnome.system.proxy.http",
+                "port",
+                &http_port.to_string(),
+            ])
             .status();
         let _ = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.system.proxy.https", "host", "127.0.0.1"])
             .status();
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy.https", "port", &http_port.to_string()])
+            .args([
+                "set",
+                "org.gnome.system.proxy.https",
+                "port",
+                &http_port.to_string(),
+            ])
             .status();
         let _ = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"])
             .status();
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy.socks", "port", &socks_port.to_string()])
+            .args([
+                "set",
+                "org.gnome.system.proxy.socks",
+                "port",
+                &socks_port.to_string(),
+            ])
             .status();
     }
 
@@ -152,6 +169,7 @@ pub fn clear_desktop_proxy() -> Result<()> {
 pub struct SudoProcessRunner {
     active_pid: Arc<AtomicU32>,
     is_proxy_mode: Arc<AtomicBool>,
+    defaults: Arc<std::sync::RwLock<ProtocolDefaults>>,
 }
 
 impl SudoProcessRunner {
@@ -159,6 +177,20 @@ impl SudoProcessRunner {
         Self {
             active_pid: Arc::new(AtomicU32::new(0)),
             is_proxy_mode: Arc::new(AtomicBool::new(false)),
+            defaults: Arc::new(std::sync::RwLock::new(ProtocolDefaults::default())),
+        }
+    }
+
+    pub fn with_defaults(self, defaults: ProtocolDefaults) -> Self {
+        if let Ok(mut lock) = self.defaults.write() {
+            *lock = defaults;
+        }
+        self
+    }
+
+    pub fn set_defaults(&self, defaults: ProtocolDefaults) {
+        if let Ok(mut lock) = self.defaults.write() {
+            *lock = defaults;
         }
     }
 
@@ -294,6 +326,12 @@ impl SudoProcessRunner {
 }
 
 impl VpnRunner for SudoProcessRunner {
+    fn set_defaults(&self, defaults: crate::domain::config::ProtocolDefaults) {
+        if let Ok(mut lock) = self.defaults.write() {
+            *lock = defaults;
+        }
+    }
+
     async fn check_sudo_cached(&self) -> bool {
         let output = Command::new("sudo").arg("-n").arg("-v").output().await;
 
@@ -336,10 +374,13 @@ impl VpnRunner for SudoProcessRunner {
         sudo_password: Option<&str>,
         event_tx: mpsc::UnboundedSender<LogEvent>,
     ) -> Result<()> {
+        let defaults = self.defaults.read().ok().map(|g| g.clone());
+        let defaults_ref = defaults.as_ref();
+
         let (use_sudo, binary, args, stdin_data) = match profile.protocol {
             VpnProtocol::OpenConnect => {
                 let has_password = creds.and_then(|c| c.password.as_deref()).is_some();
-                let args = build_openconnect_args(profile, creds, has_password);
+                let args = build_openconnect_args(profile, creds, has_password, defaults_ref);
                 let stdin_data = creds
                     .and_then(|c| c.password.as_deref())
                     .map(|p| format!("{}\n", p));
@@ -366,7 +407,7 @@ impl VpnRunner for SudoProcessRunner {
                     None
                 };
 
-                let args = build_openvpn_args(profile, auth_file_path.as_deref());
+                let args = build_openvpn_args(profile, auth_file_path.as_deref(), defaults_ref);
                 (true, "openvpn".to_string(), args, None)
             }
             VpnProtocol::V2Ray => {
@@ -705,7 +746,10 @@ Please enter your username and password.
 
     #[test]
     fn test_build_execution_command_privileged_no_preserve_env() {
-        let args = vec!["--server=vpn.corp.com".to_string(), "--user=alice".to_string()];
+        let args = vec![
+            "--server=vpn.corp.com".to_string(),
+            "--user=alice".to_string(),
+        ];
         let cmd = SudoProcessRunner::build_execution_command(true, "sh", &args);
         let std_cmd = cmd.as_std();
 
@@ -728,7 +772,11 @@ Please enter your username and password.
 
     #[test]
     fn test_build_execution_command_unprivileged() {
-        let args = vec!["run".to_string(), "-c".to_string(), "config.json".to_string()];
+        let args = vec![
+            "run".to_string(),
+            "-c".to_string(),
+            "config.json".to_string(),
+        ];
         let cmd = SudoProcessRunner::build_execution_command(false, "sh", &args);
         let std_cmd = cmd.as_std();
 
@@ -753,5 +801,22 @@ Please enter your username and password.
 
         let _ = clear_desktop_proxy();
         assert!(!env_file.exists());
+    }
+
+    #[test]
+    fn test_sudo_process_runner_defaults_management() {
+        let runner = SudoProcessRunner::new();
+        assert_eq!(
+            *runner.defaults.read().unwrap(),
+            ProtocolDefaults::default()
+        );
+
+        let mut custom = ProtocolDefaults::default();
+        custom.openconnect_flags.push("--custom-flag".into());
+        runner.set_defaults(custom.clone());
+        assert_eq!(*runner.defaults.read().unwrap(), custom);
+
+        let runner2 = SudoProcessRunner::new().with_defaults(custom.clone());
+        assert_eq!(*runner2.defaults.read().unwrap(), custom);
     }
 }

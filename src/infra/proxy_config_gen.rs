@@ -1,15 +1,10 @@
 use crate::domain::config::{ProxyCore, ProxyEndpoint, ProxyRoutingMode, ProxyType};
-use anyhow::{bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, bail};
+use serde_json::{Value, json};
 
 /// Generates a valid JSON configuration object for `sing-box`.
-pub fn generate_singbox_config(
-    endpoint: &ProxyEndpoint,
-    mode: ProxyRoutingMode,
-) -> Result<Value> {
-    let proto = endpoint
-        .protocol_type
-        .unwrap_or(ProxyType::Vless);
+pub fn generate_singbox_config(endpoint: &ProxyEndpoint, mode: ProxyRoutingMode) -> Result<Value> {
+    let proto = endpoint.protocol_type.unwrap_or(ProxyType::Vless);
 
     let mut inbounds = Vec::new();
     match mode {
@@ -147,13 +142,8 @@ pub fn generate_singbox_config(
 }
 
 /// Generates a valid JSON configuration object for `xray` or `v2ray` (v4 schema).
-pub fn generate_xray_config(
-    endpoint: &ProxyEndpoint,
-    mode: ProxyRoutingMode,
-) -> Result<Value> {
-    let proto = endpoint
-        .protocol_type
-        .unwrap_or(ProxyType::Vless);
+pub fn generate_xray_config(endpoint: &ProxyEndpoint, mode: ProxyRoutingMode) -> Result<Value> {
+    let proto = endpoint.protocol_type.unwrap_or(ProxyType::Vless);
 
     let mut inbounds = Vec::new();
     inbounds.push(json!({

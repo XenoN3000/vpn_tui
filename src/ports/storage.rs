@@ -1,5 +1,5 @@
 use crate::domain::account::{Account, AccountId};
-use crate::domain::config::{Profile, ProfileId, VpnProtocol};
+use crate::domain::config::{Profile, ProfileId, ProtocolDefaults, VpnProtocol};
 use crate::domain::subscription::Subscription;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -108,6 +108,9 @@ pub trait ConfigStorage: Send + Sync {
 
     fn load_biovpn_portals(&self) -> Result<BioVpnPortalsConfig>;
     fn save_biovpn_portals(&mut self, config: &BioVpnPortalsConfig) -> Result<()>;
+
+    fn load_defaults(&self) -> Result<ProtocolDefaults>;
+    fn save_defaults(&mut self, defaults: &ProtocolDefaults) -> Result<()>;
 }
 
 /// In-memory mock storage for unit testing.
@@ -119,6 +122,7 @@ pub struct InMemoryStorage {
     pub folders: Vec<String>,
     pub subscriptions: Vec<Subscription>,
     pub biovpn_portals: Option<BioVpnPortalsConfig>,
+    pub defaults: Option<ProtocolDefaults>,
 }
 
 impl InMemoryStorage {
@@ -130,6 +134,7 @@ impl InMemoryStorage {
             folders: Vec::new(),
             subscriptions: Vec::new(),
             biovpn_portals: None,
+            defaults: None,
         }
     }
 }
@@ -209,11 +214,34 @@ impl ConfigStorage for InMemoryStorage {
         self.biovpn_portals = Some(config.clone());
         Ok(())
     }
+
+    fn load_defaults(&self) -> Result<ProtocolDefaults> {
+        Ok(self.defaults.clone().unwrap_or_default())
+    }
+
+    fn save_defaults(&mut self, defaults: &ProtocolDefaults) -> Result<()> {
+        self.defaults = Some(defaults.clone());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_in_memory_storage_defaults_crud() {
+        let mut storage = InMemoryStorage::new();
+        let def = storage.load_defaults().unwrap();
+        assert_eq!(def, ProtocolDefaults::default());
+
+        let mut custom = ProtocolDefaults::default();
+        custom.openconnect_flags.push("--custom-flag".into());
+        storage.save_defaults(&custom).unwrap();
+
+        let loaded = storage.load_defaults().unwrap();
+        assert_eq!(loaded, custom);
+    }
 
     #[test]
     fn test_in_memory_storage_subscription_crud() {

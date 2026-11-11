@@ -39,7 +39,12 @@ async fn test_full_vpn_tui_lifecycle_e2e() {
     assert_eq!(app.active_pane, ActivePane::Profiles);
 
     // 3. Ping all configurations
-    app.handle_key(KeyCode::Char('p')).await.unwrap();
+    app.handle_key(KeyCode::Char('P')).await.unwrap();
+    let ev1 = app.app_event_rx.recv().await.unwrap();
+    app.handle_app_event(ev1);
+    let ev2 = app.app_event_rx.recv().await.unwrap();
+    app.handle_app_event(ev2);
+
     let p0 = app.profiles.iter().find(|p| p.name == "Munich DC").unwrap();
     assert_eq!(p0.latency, LatencyState::Measured(18));
     let p1 = app
@@ -468,4 +473,215 @@ async fn test_accounts_manager_navigation_and_delete() {
     // 4. Press Esc to return to Profiles
     app.handle_key(KeyCode::Esc).await.unwrap();
     assert_eq!(app.active_pane, ActivePane::Profiles);
+}
+
+fn create_synthetic_captcha(code: &str) -> Vec<u8> {
+    use vpn_tui::infra::biovpn_client::GD_FONT5_TEMPLATES;
+    let width = 50;
+    let height = 24;
+    let mut pixels = vec![22u8, 86, 165].repeat(width * height);
+    let x_starts = [5, 14, 23, 32];
+
+    for (i, ch) in code.chars().enumerate().take(4) {
+        let x_start = x_starts[i];
+        if let Some((_, tmpl)) = GD_FONT5_TEMPLATES.iter().find(|(c, _)| *c == ch) {
+            for (dy, row) in tmpl.lines().enumerate() {
+                let y = 8 + dy;
+                for (dx, bit) in row.chars().enumerate() {
+                    if bit == '1' {
+                        let x = x_start + dx;
+                        let idx = (y * width + x) * 3;
+                        pixels[idx] = 255;
+                        pixels[idx + 1] = 255;
+                        pixels[idx + 2] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&pixels).unwrap();
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_biovpn_sync_with_cisco_gen_and_table_ovpn_import_e2e() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut zip_buf);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("PL_Warsaw.ovpn", options).unwrap();
+        writer
+            .write_all(b"client\ndev tun\nremote 45.252.182.34 1194\n")
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let fake_zip = zip_buf.into_inner();
+
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let captcha_png = create_synthetic_captcha("1234");
+
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            if req.starts_with("GET /clientarea/") && !req.to_lowercase().contains("cookie:") {
+                let resp = "HTTP/1.1 200 OK\r\nConnection: close\r\nSet-Cookie: PHPSESSID=mock123; Path=/\r\nContent-Length: 20\r\n\r\n<form>login</form>";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            } else if req.starts_with("GET /captcha.php") {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                    captcha_png.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&captcha_png).await;
+            } else if req.starts_with("POST /clientarea/") {
+                let body = "<html><body>پنل کاربری کاربر خوش آمدید</body></html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            } else if req
+                .starts_with("GET /clientarea/index.php?download_ovpn=1&server=OPNL.cdntak.com")
+            {
+                let body = "client\ndev tun\nremote 45.93.169.132 1194\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            } else if req
+                .starts_with("GET /clientarea/index.php?download_ovpn=1&server=FAIL.cdntak.com")
+            {
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            } else if req.starts_with("GET /clientarea/") {
+                let body = r#"<html><body><a href="/dl/BioVPN-SmartTCP.zip">Download</a><table><tr class="bio-server-group-toggle"><th>هلند</th></tr><tr class="bio-server-child-row"><th>هلند هوشمند</th><td><span class="server-address">NL1.cdntak.com</span></td><td><a class="bio-ovpn-download" href="/clientarea/index.php?download_ovpn=1&amp;server=OPNL.cdntak.com">دانلود کانفیگ</a></td></tr><tr class="bio-server-child-row"><th>هلند خراب</th><td><span class="server-address">FAIL.cdntak.com</span></td><td><a class="bio-ovpn-download" href="/clientarea/index.php?download_ovpn=1&amp;server=FAIL.cdntak.com">دانلود کانفیگ</a></td></tr></table></body></html>"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            } else if req.starts_with("GET /dl/BioVPN-SmartTCP.zip") {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/zip\r\nContent-Length: {}\r\n\r\n",
+                    fake_zip.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&fake_zip).await;
+            } else {
+                let resp =
+                    "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let mut storage = InMemoryStorage::new();
+    let creds = vpn_tui::domain::account::Credentials {
+        username: Some("testuser".to_string()),
+        password: Some("testpass".to_string()),
+        auth_group: None,
+        cert_path: None,
+        token: None,
+    };
+    let account = Account::new("BioAccount").with_credentials(creds);
+    storage.save_account(&account).unwrap();
+
+    let mut app = App::new(storage, MockVpnRunner::new(), MockPinger::new());
+    app.biovpn_portals.urls = vec![base_url.clone()];
+
+    // Open SyncManager modal with with_cisco = true
+    let mut sync_state = vpn_tui::app::SyncManagerState::with_portals(&app.biovpn_portals);
+    sync_state.target_account_idx = Some(0);
+    sync_state.with_cisco = true;
+    app.active_modal = ActiveModal::SyncManager(sync_state);
+
+    // Trigger online sync
+    app.handle_key(KeyCode::Enter).await.unwrap();
+    app.wait_for_sync().await;
+
+    assert_eq!(app.active_modal, ActiveModal::None);
+
+    // 1. Verify Cisco profile from table
+    let table_cisco = app
+        .profiles
+        .iter()
+        .find(|p| p.name.contains("هلند هوشمند") && p.protocol == VpnProtocol::OpenConnect)
+        .expect("Table Cisco profile should exist");
+    assert_eq!(
+        table_cisco.group.as_deref(),
+        Some("BioVPN/Cisco/Netherlands")
+    );
+    assert_eq!(table_cisco.endpoint, "NL1.cdntak.com:443");
+
+    // 2. Verify OpenVPN profile from table download (Fixes Problem 2)
+    let table_ovpn = app
+        .profiles
+        .iter()
+        .find(|p| p.name.contains("هلند هوشمند") && p.protocol == VpnProtocol::OpenVpn)
+        .expect("Table OpenVPN profile should exist");
+    assert_eq!(
+        table_ovpn.group.as_deref(),
+        Some("BioVPN/OpenVPN/Netherlands")
+    );
+    assert_eq!(table_ovpn.endpoint, "45.93.169.132:1194");
+
+    // 3. Verify OpenVPN profile from ZIP bundle
+    let zip_ovpn = app
+        .profiles
+        .iter()
+        .find(|p| p.name.contains("PL Warsaw") && p.protocol == VpnProtocol::OpenVpn)
+        .expect("ZIP OpenVPN profile should exist");
+    assert_eq!(zip_ovpn.group.as_deref(), Some("BioVPN/OpenVPN"));
+    assert_eq!(zip_ovpn.endpoint, "45.252.182.34:1194");
+
+    // 4. Verify Cisco profile generated from ZIP OpenVPN remote (Fixes Problem 1)
+    let zip_cisco = app
+        .profiles
+        .iter()
+        .find(|p| p.name.contains("PL Warsaw") && p.protocol == VpnProtocol::OpenConnect)
+        .expect("ZIP Cisco profile should be generated when with_cisco is true");
+    assert_eq!(zip_cisco.group.as_deref(), Some("BioVPN/Cisco"));
+    assert_eq!(zip_cisco.endpoint, "45.252.182.34:443");
+
+    // 5. Verify folder hierarchies are properly registered and expanded
+    assert!(app.expanded_folders.contains("BioVPN"));
+    assert!(app.expanded_folders.contains("BioVPN/Cisco"));
+    assert!(app.expanded_folders.contains("BioVPN/OpenVPN"));
+    assert!(app.expanded_folders.contains("BioVPN/OpenVPN/Netherlands"));
+    assert!(app.expanded_folders.contains("BioVPN/Cisco/Netherlands"));
+
+    // 6. Verify error log was captured in the application log window
+    assert!(
+        app.logs.iter().any(|l| l
+            .contains("Warning: Failed to download OpenVPN config for 'هلند خراب'")
+            && l.contains("HTTP 500")),
+        "Error log for failed OpenVPN download should appear in app.logs"
+    );
 }

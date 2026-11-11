@@ -29,6 +29,13 @@ A lightweight, modern, and asynchronous Terminal User Interface (TUI) for managi
 ## Features
 
 - **Multi-Protocol Support**: Seamlessly configure and connect to both OpenConnect and OpenVPN gateways.
+- **Global Protocol Defaults & Dynamic Flag Inheritance (`D`)**:
+  - Centralized management of global default flags persisted in `defaults.toml`.
+  - Built-in standard defaults: OpenConnect (`--protocol=anyconnect --no-dtls --pfs`) and OpenVPN (`--dev tun --redirect-gateway def1`).
+  - Automatic inheritance: all newly created or synced profiles automatically inherit global protocol defaults.
+  - Per-profile toggle (`Inherit Default Flags`): easily enable/disable inheritance per profile; profile flags override or deduplicate against defaults.
+  - Live inspection in Details pane: displays inheritance status (`[ON]` / `[OFF]`), custom flags, default batch, and effective execution arguments.
+  - Quick defaults editor modal opened via **`D`** from Profiles or Flags pane.
 - **Hierarchical Configuration Folders & Tree Navigation**:
   - Organize profiles into unlimited folder paths (e.g. `BioVPN/Cisco`, `BioVPN/OpenVPN`, `Work/Europe/Frankfurt`).
   - Interactive tree folding: expand and collapse folders with **`Space`**, **`Enter`**, **`←`**, and **`→`**.
@@ -116,7 +123,7 @@ A lightweight, modern, and asynchronous Terminal User Interface (TUI) for managi
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/vpn_tui.git
+git clone https://github.com/XenoN3000/vpn_tui.git
 cd vpn_tui
 
 # Build the release binary
@@ -245,6 +252,8 @@ The **Accounts Pane** lives directly on the main screen above your Configuration
 | **`S`** / **`s`** | Open Sync & Import Configurations modal |
 | **`A`** | Toggle Expand/Collapse Accounts pane on main dashboard |
 | **`a`** | Quick-add a new account modal |
+| **`D`** | Open Protocol Defaults Editor modal (from Profiles or Flags pane) |
+| **`i`** / **`I`** | Toggle default flags inheritance checkbox on selected profile (Profiles or Flags pane) |
 | **`m`** / **`M`** | Create a new configuration folder modal |
 | **`n`** | Create a new configuration profile manually (with optional folder/group) |
 | **`e`** | Edit selected profile or account |
@@ -258,6 +267,10 @@ The **Accounts Pane** lives directly on the main screen above your Configuration
 | :--- | :--- | :--- |
 | **New Folder** | `Text Input` | Enter folder name or hierarchical path (e.g. `BioVPN/Cisco`) |
 | | `Enter` | Create and persist folder |
+| | `Esc` | Cancel and close modal |
+| **Protocol Defaults** | `Tab` / `BackTab` / `↑` / `↓` | Switch between OpenConnect and OpenVPN default flag fields |
+| | `Text Input` | Edit space-separated default flags |
+| | `Enter` | Save defaults to `defaults.toml` and apply immediately |
 | | `Esc` | Cancel and close modal |
 | **Sync Manager** | `↑` / `↓` | Select import method |
 | | `Tab` | Cycle target account |
@@ -294,6 +307,7 @@ The **Accounts Pane** lives directly on the main screen above your Configuration
 ```text
 ~/.config/bio-vpn-tui/   (or ~/.config/vpn-tui/)
 ├── accounts.toml         # Account credentials (usernames, passwords, authgroups)
+├── defaults.toml         # Global protocol default flags (OpenConnect & OpenVPN)
 ├── folders.toml          # Saved explicit/empty folder paths
 ├── openconnect/          # OpenConnect configuration profiles
 │   ├── nl.toml

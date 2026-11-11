@@ -14,6 +14,7 @@ use vpn_tui::infra::fs_storage::FsConfigStorage;
 use vpn_tui::infra::net_monitor::NetMonitor;
 use vpn_tui::infra::process_runner::SudoProcessRunner;
 use vpn_tui::infra::tcp_pinger::TcpPinger;
+use vpn_tui::ports::storage::ConfigStorage;
 use vpn_tui::ui::modals::render_modal;
 use vpn_tui::ui::theme::Theme;
 use vpn_tui::ui::views::render_ui;
@@ -36,7 +37,8 @@ async fn main() -> Result<()> {
 
     // 3. Initialize Clean Architecture components
     let storage = FsConfigStorage::new();
-    let runner = SudoProcessRunner::new();
+    let defaults = storage.load_defaults().unwrap_or_default();
+    let runner = SudoProcessRunner::new().with_defaults(defaults);
     let pinger = TcpPinger::new();
     let mut app = App::new(storage, runner, pinger);
     let mut net_monitor = NetMonitor::new();
@@ -60,6 +62,11 @@ async fn main() -> Result<()> {
                     let _ = app.disconnect().await;
                 }
                 app.should_quit = true;
+            }
+            app_event = app.app_event_rx.recv() => {
+                if let Some(ev) = app_event {
+                    app.handle_app_event(ev);
+                }
             }
             log_event = async {
                 match &mut app.event_rx {

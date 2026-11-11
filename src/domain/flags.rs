@@ -1,5 +1,5 @@
 use super::account::Credentials;
-use super::config::{Profile, SslPolicy};
+use super::config::{Profile, ProtocolDefaults, SslPolicy};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -35,6 +35,7 @@ pub fn build_openconnect_args(
     profile: &Profile,
     credentials: Option<&Credentials>,
     passwd_on_stdin: bool,
+    defaults: Option<&ProtocolDefaults>,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -90,15 +91,36 @@ pub fn build_openconnect_args(
         args.push("--no-cert-check".into());
     }
 
-    // Profile custom / preset flags
-    for flag in &profile.flags {
-        let trimmed = flag.trim();
-        if !trimmed.is_empty() {
-            // Split if flag contains multiple space-separated arguments
-            for part in trimmed.split_whitespace() {
-                args.push(part.to_string());
+    // Merge default flags if inherit_defaults is true
+    let default_flags: Vec<String> = if profile.inherit_defaults {
+        defaults
+            .map(|d| d.openconnect_flags.clone())
+            .unwrap_or_else(crate::domain::config::default_openconnect_flags)
+    } else {
+        Vec::new()
+    };
+
+    let mut combined_flags = Vec::new();
+    for f in &default_flags {
+        for part in f.split_whitespace() {
+            if !part.starts_with("--protocol=") {
+                combined_flags.push(part.to_string());
             }
         }
+    }
+    for f in &profile.flags {
+        for part in f.split_whitespace() {
+            combined_flags.push(part.to_string());
+        }
+    }
+
+    for flag in combined_flags {
+        if (flag == "--no-dtls" || flag == "--pfs" || flag == "--no-cert-check")
+            && args.iter().any(|a| a == &flag)
+        {
+            continue;
+        }
+        args.push(flag);
     }
 
     // Server endpoint URL/host
@@ -108,7 +130,11 @@ pub fn build_openconnect_args(
 }
 
 /// Builds the command line argument list for `openvpn`.
-pub fn build_openvpn_args(profile: &Profile, auth_user_pass_path: Option<&Path>) -> Vec<String> {
+pub fn build_openvpn_args(
+    profile: &Profile,
+    auth_user_pass_path: Option<&Path>,
+    defaults: Option<&ProtocolDefaults>,
+) -> Vec<String> {
     let mut args = Vec::new();
 
     if let Some(ovpn_path) = &profile.ovpn_file {
@@ -121,12 +147,35 @@ pub fn build_openvpn_args(profile: &Profile, auth_user_pass_path: Option<&Path>)
         args.push(auth_path.to_string_lossy().to_string());
     }
 
+    let default_flags: Vec<String> = if profile.inherit_defaults {
+        defaults
+            .map(|d| d.openvpn_flags.clone())
+            .unwrap_or_else(crate::domain::config::default_openvpn_flags)
+    } else {
+        Vec::new()
+    };
+
+    let profile_has_dev = profile.flags.iter().any(|f| f.contains("--dev"));
+    let profile_has_redirect = profile
+        .flags
+        .iter()
+        .any(|f| f.contains("--redirect-gateway"));
+
+    for flag in &default_flags {
+        if profile_has_dev && flag.contains("--dev") {
+            continue;
+        }
+        if profile_has_redirect && flag.contains("--redirect-gateway") {
+            continue;
+        }
+        for part in flag.split_whitespace() {
+            args.push(part.to_string());
+        }
+    }
+
     for flag in &profile.flags {
-        let trimmed = flag.trim();
-        if !trimmed.is_empty() {
-            for part in trimmed.split_whitespace() {
-                args.push(part.to_string());
-            }
+        for part in flag.split_whitespace() {
+            args.push(part.to_string());
         }
     }
 
@@ -151,16 +200,34 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn test_build_openconnect_args_basic() {
-        let profile = Profile::new_openconnect("Work", "vpn.corp.com:443");
-        let args = build_openconnect_args(&profile, None, false);
+    fn test_build_openconnect_args_basic_without_defaults() {
+        let profile =
+            Profile::new_openconnect("Work", "vpn.corp.com:443").with_inherit_defaults(false);
+        let args = build_openconnect_args(&profile, None, false, None);
 
         assert_eq!(args, vec!["--protocol=anyconnect", "vpn.corp.com:443"]);
     }
 
     #[test]
+    fn test_build_openconnect_args_with_inherited_defaults() {
+        let profile = Profile::new_openconnect("Work", "vpn.corp.com:443");
+        let args = build_openconnect_args(&profile, None, false, None);
+
+        assert_eq!(
+            args,
+            vec![
+                "--protocol=anyconnect",
+                "--no-dtls",
+                "--pfs",
+                "vpn.corp.com:443"
+            ]
+        );
+    }
+
+    #[test]
     fn test_build_openconnect_args_with_creds_and_flags() {
-        let mut profile = Profile::new_openconnect("Work Pulse", "gateway.corp.com");
+        let mut profile =
+            Profile::new_openconnect("Work Pulse", "gateway.corp.com").with_inherit_defaults(false);
         profile.openconnect_protocol = Some("pulse".into());
         profile.flags = vec!["--no-dtls".into(), "--servercert=pin-sha256:abcd".into()];
 
@@ -172,7 +239,7 @@ mod tests {
             token: None,
         };
 
-        let args = build_openconnect_args(&profile, Some(&creds), true);
+        let args = build_openconnect_args(&profile, Some(&creds), true, None);
 
         assert_eq!(
             args,
@@ -190,16 +257,30 @@ mod tests {
     }
 
     #[test]
-    fn test_build_openvpn_args_with_ovpn_file() {
+    fn test_build_openconnect_args_deduplicate_flags() {
+        let profile = Profile::new_openconnect("Work", "vpn.corp.com:443")
+            .with_flag("--no-dtls")
+            .with_flag("--pfs");
+        let args = build_openconnect_args(&profile, None, false, None);
+
+        let dtls_count = args.iter().filter(|&a| a == "--no-dtls").count();
+        let pfs_count = args.iter().filter(|&a| a == "--pfs").count();
+        assert_eq!(dtls_count, 1);
+        assert_eq!(pfs_count, 1);
+    }
+
+    #[test]
+    fn test_build_openvpn_args_with_ovpn_file_without_defaults() {
         let profile = Profile::new_openvpn(
             "Client VPN",
             "1.2.3.4:1194",
             Some(PathBuf::from("/etc/openvpn/client.ovpn")),
         )
+        .with_inherit_defaults(false)
         .with_flag("--dev tun0");
 
         let auth_path = PathBuf::from("/tmp/auth.txt");
-        let args = build_openvpn_args(&profile, Some(&auth_path));
+        let args = build_openvpn_args(&profile, Some(&auth_path), None);
 
         assert_eq!(
             args,
@@ -215,10 +296,60 @@ mod tests {
     }
 
     #[test]
+    fn test_build_openvpn_args_with_inherited_defaults() {
+        let profile = Profile::new_openvpn(
+            "Client VPN",
+            "1.2.3.4:1194",
+            Some(PathBuf::from("/etc/openvpn/client.ovpn")),
+        );
+
+        let args = build_openvpn_args(&profile, None, None);
+
+        assert_eq!(
+            args,
+            vec![
+                "--config",
+                "/etc/openvpn/client.ovpn",
+                "--dev",
+                "tun",
+                "--redirect-gateway",
+                "def1"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_openvpn_args_override_defaults() {
+        let profile = Profile::new_openvpn(
+            "Client VPN",
+            "1.2.3.4:1194",
+            Some(PathBuf::from("/etc/openvpn/client.ovpn")),
+        )
+        .with_flag("--dev tap");
+
+        let args = build_openvpn_args(&profile, None, None);
+
+        // --dev tun should be omitted in favor of profile's --dev tap
+        assert!(!args.iter().any(|a| a == "tun"));
+        assert_eq!(
+            args,
+            vec![
+                "--config",
+                "/etc/openvpn/client.ovpn",
+                "--redirect-gateway",
+                "def1",
+                "--dev",
+                "tap"
+            ]
+        );
+    }
+
+    #[test]
     fn test_build_openconnect_args_insecure_policy() {
         let profile = Profile::new_openconnect("Insecure Gateway", "vpn.corp.com:443")
+            .with_inherit_defaults(false)
             .with_ssl_policy(SslPolicy::Insecure);
-        let args = build_openconnect_args(&profile, None, false);
+        let args = build_openconnect_args(&profile, None, false, None);
 
         assert_eq!(
             args,
@@ -233,9 +364,10 @@ mod tests {
     #[test]
     fn test_build_openconnect_args_insecure_policy_no_duplicates() {
         let profile = Profile::new_openconnect("Insecure Gateway", "vpn.corp.com:443")
+            .with_inherit_defaults(false)
             .with_ssl_policy(SslPolicy::Insecure)
             .with_flag("--no-cert-check");
-        let args = build_openconnect_args(&profile, None, false);
+        let args = build_openconnect_args(&profile, None, false, None);
 
         let count = args.iter().filter(|&a| a == "--no-cert-check").count();
         assert_eq!(count, 1);
@@ -243,8 +375,9 @@ mod tests {
 
     #[test]
     fn test_build_openvpn_args_without_ovpn_file() {
-        let profile = Profile::new_openvpn("Raw Remote", "10.0.0.1:443", None);
-        let args = build_openvpn_args(&profile, None);
+        let profile =
+            Profile::new_openvpn("Raw Remote", "10.0.0.1:443", None).with_inherit_defaults(false);
+        let args = build_openvpn_args(&profile, None, None);
 
         assert_eq!(args, vec!["--remote", "10.0.0.1", "443"]);
     }

@@ -86,6 +86,8 @@ impl FileBrowserState {
                         });
                     } else if file_name.to_lowercase().ends_with(".ovpn")
                         || file_name.to_lowercase().ends_with(".zip")
+                        || file_name.to_lowercase().ends_with(".html")
+                        || file_name.to_lowercase().ends_with(".htm")
                     {
                         ovpn_files.push(FileEntry {
                             name: file_name,
@@ -341,11 +343,15 @@ pub mod browser_state {
 
         let ovpn1 = dir.path().join("profile1.ovpn");
         let ovpn2 = dir.path().join("profile2.OVPN");
+        let zip_file = dir.path().join("bundle.zip");
+        let html_file = dir.path().join("portal.html");
         let ignored_txt = dir.path().join("notes.txt");
         let hidden = dir.path().join(".secret.ovpn");
 
         File::create(&ovpn1).expect("create ovpn1");
         File::create(&ovpn2).expect("create ovpn2");
+        File::create(&zip_file).expect("create zip");
+        File::create(&html_file).expect("create html");
         File::create(&ignored_txt).expect("create notes.txt");
         File::create(&hidden).expect("create hidden");
 
@@ -359,6 +365,8 @@ pub mod browser_state {
         assert!(names.contains(&"vpn_profiles".to_string()));
         assert!(names.contains(&"profile1.ovpn".to_string()));
         assert!(names.contains(&"profile2.OVPN".to_string()));
+        assert!(names.contains(&"bundle.zip".to_string()));
+        assert!(names.contains(&"portal.html".to_string()));
         assert!(
             !names.contains(&"notes.txt".to_string()),
             "txt files must be filtered out"
